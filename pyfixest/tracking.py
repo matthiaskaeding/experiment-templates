@@ -16,40 +16,40 @@ _MULTI_MODEL_ERROR = (
 )
 
 
-def _feols_metrics(fit: Any) -> dict[str, float]:
-    metrics = {}
-    for name, attr in (
-        ("nobs", "_N"),
-        ("r2", "_r2"),
-        ("adj_r2", "_adj_r2"),
-        ("f_statistic", "_f_statistic"),
-        ("rmse", "_rmse"),
-    ):
-        try:
-            metrics[name] = float(getattr(fit, attr))
-        except AttributeError:
-            pass
-    return metrics
+_FEOLS_METRIC_ATTRS = (
+    ("nobs", "_N"),
+    ("r2", "_r2"),
+    ("adj_r2", "_adj_r2"),
+    ("f_statistic", "_f_statistic"),
+    ("rmse", "_rmse"),
+)
 
+_FEPOIS_METRIC_ATTRS = (
+    ("nobs", "_N"),
+    ("pseudo_r2", "_pseudo_r2"),
+    ("deviance", "deviance"),
+)
 
-def _fepois_metrics(fit: Any) -> dict[str, float]:
-    metrics = {}
-    for name, attr in (
-        ("nobs", "_N"),
-        ("pseudo_r2", "_pseudo_r2"),
-        ("deviance", "deviance"),
-    ):
-        try:
-            metrics[name] = float(getattr(fit, attr))
-        except AttributeError:
-            pass
-    return metrics
-
-
-_METRIC_FNS: dict[Callable[..., Any], Callable[[Any], dict[str, float]]] = {
-    pf.feols: _feols_metrics,
-    pf.fepois: _fepois_metrics,
+_METRIC_ATTRS: dict[Callable[..., Any], tuple[tuple[str, str], ...]] = {
+    pf.feols: _FEOLS_METRIC_ATTRS,
+    pf.fepois: _FEPOIS_METRIC_ATTRS,
 }
+
+
+def _extract_metrics(fit: Any, attrs: tuple[tuple[str, str], ...]) -> dict[str, float]:
+    """Read each (metric_name, attribute) pair off fit via direct access.
+
+    Metrics are pyfixest internals without a stable public getter, and not every
+    attribute applies to every model type (e.g. fepois has no F-statistic), so a
+    missing attribute is skipped rather than treated as an error.
+    """
+    metrics = {}
+    for name, attr in attrs:
+        try:
+            metrics[name] = float(getattr(fit, attr))
+        except AttributeError:
+            pass
+    return metrics
 
 
 def run_experiment(
@@ -71,10 +71,10 @@ def run_experiment(
     ``ValueError``. This is checked upfront by parsing the formula, before
     ``model_fn`` runs, and again on the returned object as a backstop.
 
-    Metrics are looked up via ``_METRIC_FNS[model_fn]``, which picks the metrics
-    relevant to that model type (e.g. ``fepois`` has no R2), and are logged to MLflow
-    together with the coefficient table. The object returned by ``model_fn`` is
-    returned unchanged.
+    Which metrics get logged depends on the model type (e.g. ``fepois`` has no R2):
+    ``_METRIC_ATTRS[model_fn]`` gives the (metric_name, attribute) pairs to read off
+    the fit, via ``_extract_metrics``. Metrics are logged to MLflow together with the
+    coefficient table. The object returned by ``model_fn`` is returned unchanged.
     """
     model_fn = _resolve_model_fn(model_fn)
 
@@ -97,8 +97,8 @@ def run_experiment(
         if isinstance(fit, FixestMulti):
             raise ValueError(_MULTI_MODEL_ERROR)
 
-        metrics_fn = _METRIC_FNS.get(model_fn, _feols_metrics)
-        mlflow.log_metrics(metrics_fn(fit))
+        attrs = _METRIC_ATTRS.get(model_fn, _FEOLS_METRIC_ATTRS)
+        mlflow.log_metrics(_extract_metrics(fit, attrs))
 
         coef_table = fit.tidy().reset_index()
         mlflow.log_table(coef_table, artifact_file="coefficients.json")
