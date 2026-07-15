@@ -19,7 +19,7 @@ _METRIC_ATTRS = {
 
 def run_experiment(
     *args: Any,
-    model_fn: Callable[..., Any] = pf.feols,
+    model_fn: Callable[..., Any] | str = pf.feols,
     experiment_name: str | None = None,
     run_name: str | None = None,
     tags: dict[str, str] | None = None,
@@ -27,11 +27,15 @@ def run_experiment(
 ) -> Any:
     """Call a pyfixest modeling function inside a tracked MLflow run.
 
-    ``model_fn`` (default ``pyfixest.feols``; e.g. ``pyfixest.fepois``, ``pyfixest.feiv``
-    also work) is called as ``model_fn(*args, **kwargs)``. The F-statistic, R2, adjusted
-    R2, RMSE, number of observations, and the coefficient table are logged to MLflow for
-    the resulting model(s). The object returned by ``model_fn`` is returned unchanged.
+    ``model_fn`` (default ``pyfixest.feols``) is either a pyfixest modeling function
+    (e.g. ``pyfixest.fepois``, ``pyfixest.feiv``) or its name as a string (e.g.
+    ``"fepois"``), resolved via ``getattr(pyfixest, model_fn)``. It is called as
+    ``model_fn(*args, **kwargs)``. The F-statistic, R2, adjusted R2, RMSE, number of
+    observations, and the coefficient table are logged to MLflow for the resulting
+    model(s). The object returned by ``model_fn`` is returned unchanged.
     """
+    model_fn = _resolve_model_fn(model_fn)
+
     if experiment_name is not None:
         mlflow.set_experiment(experiment_name)
 
@@ -50,6 +54,15 @@ def run_experiment(
             _log_fit(fit, prefix=f"model{i}_" if multiple else "")
 
     return result
+
+
+def _resolve_model_fn(model_fn: Callable[..., Any] | str) -> Callable[..., Any]:
+    if not isinstance(model_fn, str):
+        return model_fn
+    resolved = getattr(pf, model_fn, None)
+    if not callable(resolved):
+        raise ValueError(f"Unknown pyfixest model function: {model_fn!r}")
+    return resolved
 
 
 def _log_param(key: str, value: Any) -> None:

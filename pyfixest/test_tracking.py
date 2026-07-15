@@ -1,5 +1,6 @@
 import mlflow
 import pyfixest as pf
+import pytest
 
 from tracking import run_experiment
 
@@ -52,3 +53,24 @@ def test_run_experiment_accepts_explicit_model_fn(tmp_path):
     run = mlflow.last_active_run()
     assert run.data.params["model_fn"] == "fepois"
     assert run.data.metrics["nobs"] == fit._N
+
+
+def test_run_experiment_accepts_model_fn_as_string(tmp_path):
+    mlflow.set_tracking_uri(f"sqlite:///{tmp_path}/mlflow.db")
+    data = pf.get_data(model="Fepois")
+
+    fit = run_experiment(
+        "Y ~ X1 + X2",
+        data=data,
+        model_fn="fepois",
+        experiment_name="string-model-fn",
+    )
+
+    run = mlflow.last_active_run()
+    assert run.data.params["model_fn"] == "fepois"
+    assert run.data.metrics["nobs"] == fit._N
+
+
+def test_run_experiment_rejects_unknown_model_fn_string():
+    with pytest.raises(ValueError, match="not_a_real_model_fn"):
+        run_experiment("Y ~ X1", data=pf.get_data(), model_fn="not_a_real_model_fn")
