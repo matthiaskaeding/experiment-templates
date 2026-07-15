@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 from typing import Any, Callable
 
 import mlflow
@@ -47,10 +48,12 @@ def _extract_metrics(fit: Any, model_fn: Callable[..., Any]) -> dict[str, float]
     return metrics
 
 
-def _positional_or_kwarg(
-    args: tuple[Any, ...], kwargs: dict[str, Any], index: int, name: str
-) -> Any:
-    return args[index] if len(args) > index else kwargs.get(name)
+def _bind_args(
+    model_fn: Callable[..., Any], args: tuple[Any, ...], kwargs: dict[str, Any]
+) -> dict[str, Any]:
+    """Map positional/keyword call args to model_fn's parameter names."""
+    bound = inspect.signature(model_fn).bind_partial(*args, **kwargs)
+    return bound.arguments
 
 
 def run_experiment(
@@ -87,17 +90,19 @@ def run_experiment(
     with mlflow.start_run(run_name=run_name, tags=tags):
         mlflow.log_param("model_fn", getattr(model_fn, "__name__", str(model_fn)))
 
-        fml = _positional_or_kwarg(args, kwargs, 0, "fml")
+        bound_args = _bind_args(model_fn, args, kwargs)
+
+        fml = bound_args.get("fml")
         if fml is not None:
             mlflow.log_param("fml", fml)
             if len(Formula.parse(fml)) > 1:
                 raise ValueError(_MULTI_MODEL_ERROR)
 
-        data = _positional_or_kwarg(args, kwargs, 1, "data")
+        data = bound_args.get("data")
         if isinstance(data, pd.DataFrame):
             mlflow.log_param("data_shape", str(data.shape))
 
-        vcov = _positional_or_kwarg(args, kwargs, 2, "vcov")
+        vcov = bound_args.get("vcov")
         if vcov is not None:
             mlflow.log_param("vcov", str(vcov))
 
