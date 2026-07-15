@@ -31,6 +31,21 @@ def test_run_experiment_rejects_multi_model_formula(tmp_path):
         run_experiment("Y ~ csw(X1, X2)", data=data, experiment_name="csw-formula")
 
 
+def test_run_experiment_rejects_multi_model_formula_before_fitting(tmp_path):
+    mlflow.set_tracking_uri(f"sqlite:///{tmp_path}/mlflow.db")
+    data = pf.get_data()
+
+    # These columns don't exist, so an actual fit would raise a pyfixest formula
+    # error instead. Getting our ValueError proves the formula was inspected
+    # before model_fn was ever called.
+    with pytest.raises(ValueError, match="single-model"):
+        run_experiment(
+            "Y ~ csw(does_not_exist_1, does_not_exist_2)",
+            data=data,
+            experiment_name="csw-formula-precheck",
+        )
+
+
 def test_run_experiment_accepts_explicit_model_fn(tmp_path):
     mlflow.set_tracking_uri(f"sqlite:///{tmp_path}/mlflow.db")
     data = pf.get_data(model="Fepois")

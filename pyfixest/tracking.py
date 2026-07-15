@@ -7,6 +7,13 @@ from typing import Any, Callable
 import mlflow
 import pandas as pd
 import pyfixest as pf
+from pyfixest.estimation.FixestMulti_ import FixestMulti
+from pyfixest.estimation.formula.parse import Formula
+
+_MULTI_MODEL_ERROR = (
+    "run_experiment only supports single-model results; the formula produced "
+    "multiple models (e.g. via sw()/csw() or multiple dependent variables)."
+)
 
 
 def _feols_metrics(fit: Any) -> dict[str, float]:
@@ -61,7 +68,8 @@ def run_experiment(
 
     Only single-model results are supported: formulas that produce several models
     (e.g. via ``sw()``/``csw()`` or multiple dependent variables) raise a
-    ``ValueError``.
+    ``ValueError``. This is checked upfront by parsing the formula, before
+    ``model_fn`` runs, and again on the returned object as a backstop.
 
     Metrics are looked up via ``_METRIC_FNS[model_fn]``, which picks the metrics
     relevant to that model type (e.g. ``fepois`` has no R2), and are logged to MLflow
@@ -80,14 +88,14 @@ def run_experiment(
         for key, value in kwargs.items():
             _log_param(key, value)
 
+        fml = args[0] if args else kwargs.get("fml")
+        if fml is not None and len(Formula.parse(fml)) > 1:
+            raise ValueError(_MULTI_MODEL_ERROR)
+
         fit = model_fn(*args, **kwargs)
 
-        if hasattr(fit, "to_list"):
-            raise ValueError(
-                "run_experiment only supports single-model results; the formula "
-                "produced multiple models (e.g. via sw()/csw() or multiple "
-                "dependent variables)."
-            )
+        if isinstance(fit, FixestMulti):
+            raise ValueError(_MULTI_MODEL_ERROR)
 
         metrics_fn = _METRIC_FNS.get(model_fn, _feols_metrics)
         mlflow.log_metrics(metrics_fn(fit))
