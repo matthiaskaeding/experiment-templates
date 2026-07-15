@@ -8,9 +8,7 @@ def test_run_experiment_logs_single_model(tmp_path):
     mlflow.set_tracking_uri(f"sqlite:///{tmp_path}/mlflow.db")
     data = pf.get_data()
 
-    fit = run_experiment(
-        pf.feols, "Y ~ X1 + X2", data=data, experiment_name="single-model"
-    )
+    fit = run_experiment("Y ~ X1 + X2", data=data, experiment_name="single-model")
 
     assert fit._r2 is not None
 
@@ -29,7 +27,7 @@ def test_run_experiment_logs_multiple_models(tmp_path):
     data = pf.get_data()
 
     result = run_experiment(
-        pf.feols, "Y + Y2 ~ X1 + X2", data=data, experiment_name="multi-model"
+        "Y + Y2 ~ X1 + X2", data=data, experiment_name="multi-model"
     )
 
     run = mlflow.last_active_run()
@@ -38,3 +36,19 @@ def test_run_experiment_logs_multiple_models(tmp_path):
     assert "model1_r2" in metrics
     assert result.to_list()[0]._depvar == "Y"
     assert result.to_list()[1]._depvar == "Y2"
+
+
+def test_run_experiment_accepts_explicit_model_fn(tmp_path):
+    mlflow.set_tracking_uri(f"sqlite:///{tmp_path}/mlflow.db")
+    data = pf.get_data(model="Fepois")
+
+    fit = run_experiment(
+        "Y ~ X1 + X2",
+        data=data,
+        model_fn=pf.fepois,
+        experiment_name="explicit-model-fn",
+    )
+
+    run = mlflow.last_active_run()
+    assert run.data.params["model_fn"] == "fepois"
+    assert run.data.metrics["nobs"] == fit._N

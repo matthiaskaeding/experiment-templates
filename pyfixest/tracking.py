@@ -6,6 +6,7 @@ from typing import Any, Callable
 
 import mlflow
 import pandas as pd
+import pyfixest as pf
 
 _METRIC_ATTRS = {
     "f_statistic": "_f_statistic",
@@ -17,8 +18,8 @@ _METRIC_ATTRS = {
 
 
 def run_experiment(
-    model_fn: Callable[..., Any],
     *args: Any,
+    model_fn: Callable[..., Any] = pf.feols,
     experiment_name: str | None = None,
     run_name: str | None = None,
     tags: dict[str, str] | None = None,
@@ -26,10 +27,10 @@ def run_experiment(
 ) -> Any:
     """Call a pyfixest modeling function inside a tracked MLflow run.
 
-    ``model_fn`` (e.g. ``pyfixest.feols``, ``pyfixest.fepois``, ``pyfixest.feiv``) is
-    called as ``model_fn(*args, **kwargs)``. The F-statistic, R2, adjusted R2, RMSE,
-    number of observations, and the coefficient table are logged to MLflow for the
-    resulting model(s). The object returned by ``model_fn`` is returned unchanged.
+    ``model_fn`` (default ``pyfixest.feols``; e.g. ``pyfixest.fepois``, ``pyfixest.feiv``
+    also work) is called as ``model_fn(*args, **kwargs)``. The F-statistic, R2, adjusted
+    R2, RMSE, number of observations, and the coefficient table are logged to MLflow for
+    the resulting model(s). The object returned by ``model_fn`` is returned unchanged.
     """
     if experiment_name is not None:
         mlflow.set_experiment(experiment_name)
