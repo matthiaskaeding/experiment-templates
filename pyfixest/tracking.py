@@ -81,8 +81,9 @@ def run_experiment(
 
     Only single-model results are supported: formulas that produce several models
     (e.g. via ``sw()``/``csw()`` or multiple dependent variables) raise a
-    ``ValueError``. This is checked upfront by parsing the formula, before
-    ``model_fn`` runs, and again on the returned object as a backstop.
+    ``ValueError``. This is checked upfront by parsing the formula, before any
+    MLflow run is opened, so an invalid formula never leaves a FAILED run behind;
+    the returned object is also checked as a backstop.
 
     Which metrics get logged depends on the model type (e.g. ``fepois`` has no R2):
     ``_extract_metrics`` picks the relevant (metric_name, attribute) pairs based on
@@ -93,25 +94,25 @@ def run_experiment(
     """
     model_fn = _resolve_model_fn(model_fn)
 
+    # Validate inputs before opening any MLflow run, so a bad formula raises
+    # without leaving a FAILED run polluting the experiment history.
+    bound_args = _bind_args(model_fn, args, kwargs)
+    fml = bound_args.get("fml")
+    data = bound_args.get("data")
+    vcov = bound_args.get("vcov")
+
+    if fml is not None and len(Formula.parse(fml)) > 1:
+        raise ValueError(_MULTI_MODEL_ERROR)
+
     if experiment_name is not None:
         mlflow.set_experiment(experiment_name)
 
     with mlflow.start_run(run_name=run_name, tags=tags):
         mlflow.log_param("model_fn", getattr(model_fn, "__name__", str(model_fn)))
-
-        bound_args = _bind_args(model_fn, args, kwargs)
-
-        fml = bound_args.get("fml")
         if fml is not None:
             mlflow.log_param("fml", fml)
-            if len(Formula.parse(fml)) > 1:
-                raise ValueError(_MULTI_MODEL_ERROR)
-
-        data = bound_args.get("data")
         if isinstance(data, pd.DataFrame):
             mlflow.log_param("data_shape", str(data.shape))
-
-        vcov = bound_args.get("vcov")
         if vcov is not None:
             mlflow.log_param("vcov", str(vcov))
 
