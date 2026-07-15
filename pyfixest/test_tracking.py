@@ -19,8 +19,23 @@ def test_run_experiment_logs_single_model(tmp_path):
     assert metrics["f_statistic"] == fit._f_statistic
     assert metrics["nobs"] == fit._N
     assert run.data.params["model_fn"] == "feols"
-    assert run.data.params["arg_0"] == "Y ~ X1 + X2"
+    assert run.data.params["fml"] == "Y ~ X1 + X2"
     assert run.data.params["data_shape"] == str(data.shape)
+
+
+def test_run_experiment_logs_vcov_and_accepts_positional_args(tmp_path):
+    mlflow.set_tracking_uri(f"sqlite:///{tmp_path}/mlflow.db")
+    data = pf.get_data()
+
+    fit = run_experiment(
+        "Y ~ X1 + X2", data, "hetero", experiment_name="positional-args"
+    )
+
+    run = mlflow.last_active_run()
+    assert run.data.params["fml"] == "Y ~ X1 + X2"
+    assert run.data.params["data_shape"] == str(data.shape)
+    assert run.data.params["vcov"] == "hetero"
+    assert fit._vcov_type == "hetero"
 
 
 def test_run_experiment_rejects_multi_model_formula(tmp_path):

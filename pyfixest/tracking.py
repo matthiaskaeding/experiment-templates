@@ -47,6 +47,12 @@ def _extract_metrics(fit: Any, model_fn: Callable[..., Any]) -> dict[str, float]
     return metrics
 
 
+def _positional_or_kwarg(
+    args: tuple[Any, ...], kwargs: dict[str, Any], index: int, name: str
+) -> Any:
+    return args[index] if len(args) > index else kwargs.get(name)
+
+
 def run_experiment(
     *args: Any,
     model_fn: Callable[..., Any] | str = pf.feols,
@@ -70,6 +76,8 @@ def run_experiment(
     ``_extract_metrics`` picks the relevant (metric_name, attribute) pairs based on
     ``model_fn``. Metrics are logged to MLflow together with the coefficient table.
     The object returned by ``model_fn`` is returned unchanged.
+
+    Only key parameters are logged: the formula, the data's shape, and vcov.
     """
     model_fn = _resolve_model_fn(model_fn)
 
@@ -78,14 +86,20 @@ def run_experiment(
 
     with mlflow.start_run(run_name=run_name, tags=tags):
         mlflow.log_param("model_fn", getattr(model_fn, "__name__", str(model_fn)))
-        for i, value in enumerate(args):
-            _log_param(f"arg_{i}", value)
-        for key, value in kwargs.items():
-            _log_param(key, value)
 
-        fml = args[0] if args else kwargs.get("fml")
-        if fml is not None and len(Formula.parse(fml)) > 1:
-            raise ValueError(_MULTI_MODEL_ERROR)
+        fml = _positional_or_kwarg(args, kwargs, 0, "fml")
+        if fml is not None:
+            mlflow.log_param("fml", fml)
+            if len(Formula.parse(fml)) > 1:
+                raise ValueError(_MULTI_MODEL_ERROR)
+
+        data = _positional_or_kwarg(args, kwargs, 1, "data")
+        if isinstance(data, pd.DataFrame):
+            mlflow.log_param("data_shape", str(data.shape))
+
+        vcov = _positional_or_kwarg(args, kwargs, 2, "vcov")
+        if vcov is not None:
+            mlflow.log_param("vcov", str(vcov))
 
         fit = model_fn(*args, **kwargs)
 
@@ -107,12 +121,3 @@ def _resolve_model_fn(model_fn: Callable[..., Any] | str) -> Callable[..., Any]:
     if not callable(resolved):
         raise ValueError(f"Unknown pyfixest model function: {model_fn!r}")
     return resolved
-
-
-def _log_param(key: str, value: Any) -> None:
-    if isinstance(value, pd.DataFrame):
-        mlflow.log_param(f"{key}_shape", str(value.shape))
-    elif isinstance(value, (str, int, float, bool)) or value is None:
-        mlflow.log_param(key, value)
-    else:
-        mlflow.log_param(key, repr(value))
