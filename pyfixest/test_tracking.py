@@ -1,7 +1,7 @@
 import mlflow
 import pyfixest as pf
 
-from experiments import run_experiment
+from tracking import run_experiment
 
 
 def test_run_experiment_logs_single_model(tmp_path):
