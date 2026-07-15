@@ -23,20 +23,12 @@ def test_run_experiment_logs_single_model(tmp_path):
     assert run.data.params["data_shape"] == str(data.shape)
 
 
-def test_run_experiment_logs_multiple_models(tmp_path):
+def test_run_experiment_rejects_multi_model_formula(tmp_path):
     mlflow.set_tracking_uri(f"sqlite:///{tmp_path}/mlflow.db")
     data = pf.get_data()
 
-    result = run_experiment(
-        "Y + Y2 ~ X1 + X2", data=data, experiment_name="multi-model"
-    )
-
-    run = mlflow.last_active_run()
-    metrics = run.data.metrics
-    assert "model0_r2" in metrics
-    assert "model1_r2" in metrics
-    assert result.to_list()[0]._depvar == "Y"
-    assert result.to_list()[1]._depvar == "Y2"
+    with pytest.raises(ValueError, match="single-model"):
+        run_experiment("Y ~ csw(X1, X2)", data=data, experiment_name="csw-formula")
 
 
 def test_run_experiment_accepts_explicit_model_fn(tmp_path):
@@ -51,8 +43,12 @@ def test_run_experiment_accepts_explicit_model_fn(tmp_path):
     )
 
     run = mlflow.last_active_run()
+    metrics = run.data.metrics
     assert run.data.params["model_fn"] == "fepois"
-    assert run.data.metrics["nobs"] == fit._N
+    assert metrics["nobs"] == fit._N
+    assert metrics["pseudo_r2"] == fit._pseudo_r2
+    assert "r2" not in metrics
+    assert "f_statistic" not in metrics
 
 
 def test_run_experiment_accepts_model_fn_as_string(tmp_path):

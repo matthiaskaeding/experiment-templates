@@ -1,4 +1,4 @@
-"""Run pyfixest estimations inside an MLflow-tracked experiment."""
+"""Run a single pyfixest estimation inside an MLflow-tracked experiment."""
 
 from __future__ import annotations
 
@@ -8,12 +8,40 @@ import mlflow
 import pandas as pd
 import pyfixest as pf
 
-_METRIC_ATTRS = {
-    "f_statistic": "_f_statistic",
-    "r2": "_r2",
-    "adj_r2": "_adj_r2",
-    "rmse": "_rmse",
-    "nobs": "_N",
+
+def _feols_metrics(fit: Any) -> dict[str, float]:
+    metrics = {}
+    for name, attr in (
+        ("nobs", "_N"),
+        ("r2", "_r2"),
+        ("adj_r2", "_adj_r2"),
+        ("f_statistic", "_f_statistic"),
+        ("rmse", "_rmse"),
+    ):
+        try:
+            metrics[name] = float(getattr(fit, attr))
+        except AttributeError:
+            pass
+    return metrics
+
+
+def _fepois_metrics(fit: Any) -> dict[str, float]:
+    metrics = {}
+    for name, attr in (
+        ("nobs", "_N"),
+        ("pseudo_r2", "_pseudo_r2"),
+        ("deviance", "deviance"),
+    ):
+        try:
+            metrics[name] = float(getattr(fit, attr))
+        except AttributeError:
+            pass
+    return metrics
+
+
+_METRIC_FNS: dict[Callable[..., Any], Callable[[Any], dict[str, float]]] = {
+    pf.feols: _feols_metrics,
+    pf.fepois: _fepois_metrics,
 }
 
 
@@ -28,11 +56,17 @@ def run_experiment(
     """Call a pyfixest modeling function inside a tracked MLflow run.
 
     ``model_fn`` (default ``pyfixest.feols``) is either a pyfixest modeling function
-    (e.g. ``pyfixest.fepois``, ``pyfixest.feiv``) or its name as a string (e.g.
-    ``"fepois"``), resolved via ``getattr(pyfixest, model_fn)``. It is called as
-    ``model_fn(*args, **kwargs)``. The F-statistic, R2, adjusted R2, RMSE, number of
-    observations, and the coefficient table are logged to MLflow for the resulting
-    model(s). The object returned by ``model_fn`` is returned unchanged.
+    (e.g. ``pyfixest.fepois``) or its name as a string (e.g. ``"fepois"``), resolved
+    via ``getattr(pyfixest, model_fn)``. It is called as ``model_fn(*args, **kwargs)``.
+
+    Only single-model results are supported: formulas that produce several models
+    (e.g. via ``sw()``/``csw()`` or multiple dependent variables) raise a
+    ``ValueError``.
+
+    Metrics are looked up via ``_METRIC_FNS[model_fn]``, which picks the metrics
+    relevant to that model type (e.g. ``fepois`` has no R2), and are logged to MLflow
+    together with the coefficient table. The object returned by ``model_fn`` is
+    returned unchanged.
     """
     model_fn = _resolve_model_fn(model_fn)
 
@@ -46,14 +80,22 @@ def run_experiment(
         for key, value in kwargs.items():
             _log_param(key, value)
 
-        result = model_fn(*args, **kwargs)
+        fit = model_fn(*args, **kwargs)
 
-        fits = result.to_list() if hasattr(result, "to_list") else [result]
-        multiple = len(fits) > 1
-        for i, fit in enumerate(fits):
-            _log_fit(fit, prefix=f"model{i}_" if multiple else "")
+        if hasattr(fit, "to_list"):
+            raise ValueError(
+                "run_experiment only supports single-model results; the formula "
+                "produced multiple models (e.g. via sw()/csw() or multiple "
+                "dependent variables)."
+            )
 
-    return result
+        metrics_fn = _METRIC_FNS.get(model_fn, _feols_metrics)
+        mlflow.log_metrics(metrics_fn(fit))
+
+        coef_table = fit.tidy().reset_index()
+        mlflow.log_table(coef_table, artifact_file="coefficients.json")
+
+    return fit
 
 
 def _resolve_model_fn(model_fn: Callable[..., Any] | str) -> Callable[..., Any]:
@@ -72,13 +114,3 @@ def _log_param(key: str, value: Any) -> None:
         mlflow.log_param(key, value)
     else:
         mlflow.log_param(key, repr(value))
-
-
-def _log_fit(fit: Any, prefix: str) -> None:
-    for metric_name, attr in _METRIC_ATTRS.items():
-        value = getattr(fit, attr, None)
-        if value is not None:
-            mlflow.log_metric(f"{prefix}{metric_name}", float(value))
-
-    coef_table = fit.tidy().reset_index()
-    mlflow.log_table(coef_table, artifact_file=f"{prefix}coefficients.json")
