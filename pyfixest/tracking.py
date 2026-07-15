@@ -16,21 +16,6 @@ _MULTI_MODEL_ERROR = (
 )
 
 
-_FEOLS_METRIC_ATTRS = (
-    ("nobs", "_N"),
-    ("r2", "_r2"),
-    ("adj_r2", "_adj_r2"),
-    ("f_statistic", "_f_statistic"),
-    ("rmse", "_rmse"),
-)
-
-_FEPOIS_METRIC_ATTRS = (
-    ("nobs", "_N"),
-    ("pseudo_r2", "_pseudo_r2"),
-    ("deviance", "deviance"),
-)
-
-
 def _extract_metrics(fit: Any, model_fn: Callable[..., Any]) -> dict[str, float]:
     """Read the metrics relevant to model_fn off fit via direct access.
 
@@ -39,9 +24,19 @@ def _extract_metrics(fit: Any, model_fn: Callable[..., Any]) -> dict[str, float]
     missing attribute is skipped rather than treated as an error.
     """
     if model_fn is pf.fepois:
-        attrs = _FEPOIS_METRIC_ATTRS
+        attrs = (
+            ("nobs", "_N"),
+            ("pseudo_r2", "_pseudo_r2"),
+            ("deviance", "deviance"),
+        )
     else:
-        attrs = _FEOLS_METRIC_ATTRS
+        attrs = (
+            ("nobs", "_N"),
+            ("r2", "_r2"),
+            ("adj_r2", "_adj_r2"),
+            ("f_statistic", "_f_statistic"),
+            ("rmse", "_rmse"),
+        )
 
     metrics = {}
     for name, attr in attrs:
