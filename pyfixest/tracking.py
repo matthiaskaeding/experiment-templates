@@ -1,20 +1,67 @@
-"""Run pyfixest estimations inside an MLflow-tracked experiment."""
+"""Run a single pyfixest estimation inside an MLflow-tracked experiment."""
 
 from __future__ import annotations
 
+import inspect
 from typing import Any, Callable
 
 import mlflow
 import pandas as pd
 import pyfixest as pf
+from pyfixest.estimation.FixestMulti_ import FixestMulti
+from pyfixest.estimation.formula.parse import Formula
 
-_METRIC_ATTRS = {
-    "f_statistic": "_f_statistic",
-    "r2": "_r2",
-    "adj_r2": "_adj_r2",
-    "rmse": "_rmse",
-    "nobs": "_N",
-}
+_MULTI_MODEL_ERROR = (
+    "run_experiment only supports single-model results; the formula produced "
+    "multiple models (e.g. via sw()/csw() or multiple dependent variables)."
+)
+
+
+def _extract_metrics(fit: Any, model_fn: Callable[..., Any]) -> dict[str, float]:
+    """Read the metrics relevant to model_fn off fit via direct access.
+
+    Metrics are pyfixest internals without a stable public getter, and not every
+    attribute applies to every model type (e.g. fepois/feglm/quantreg have no
+    F-statistic, feglm has no pseudo R2 either, and quantreg has no R2 at all), so
+    a missing attribute is skipped rather than treated as an error.
+    """
+    if model_fn is pf.fepois:
+        attrs = (
+            ("nobs", "_N"),
+            ("pseudo_r2", "_pseudo_r2"),
+            ("deviance", "deviance"),
+        )
+    elif model_fn is pf.feglm:
+        attrs = (
+            ("nobs", "_N"),
+            ("deviance", "deviance"),
+        )
+    elif model_fn is pf.quantreg:
+        attrs = (("nobs", "_N"),)
+    else:
+        attrs = (
+            ("nobs", "_N"),
+            ("r2", "_r2"),
+            ("adj_r2", "_adj_r2"),
+            ("f_statistic", "_f_statistic"),
+            ("rmse", "_rmse"),
+        )
+
+    metrics = {}
+    for name, attr in attrs:
+        try:
+            metrics[name] = float(getattr(fit, attr))
+        except AttributeError:
+            pass
+    return metrics
+
+
+def _bind_args(
+    model_fn: Callable[..., Any], args: tuple[Any, ...], kwargs: dict[str, Any]
+) -> dict[str, Any]:
+    """Map positional/keyword call args to model_fn's parameter names."""
+    bound = inspect.signature(model_fn).bind_partial(*args, **kwargs)
+    return bound.arguments
 
 
 def run_experiment(
@@ -28,11 +75,21 @@ def run_experiment(
     """Call a pyfixest modeling function inside a tracked MLflow run.
 
     ``model_fn`` (default ``pyfixest.feols``) is either a pyfixest modeling function
-    (e.g. ``pyfixest.fepois``, ``pyfixest.feiv``) or its name as a string (e.g.
-    ``"fepois"``), resolved via ``getattr(pyfixest, model_fn)``. It is called as
-    ``model_fn(*args, **kwargs)``. The F-statistic, R2, adjusted R2, RMSE, number of
-    observations, and the coefficient table are logged to MLflow for the resulting
-    model(s). The object returned by ``model_fn`` is returned unchanged.
+    (e.g. ``pyfixest.fepois``, ``pyfixest.feglm``, ``pyfixest.quantreg``) or its name
+    as a string (e.g. ``"fepois"``), resolved via ``getattr(pyfixest, model_fn)``. It
+    is called as ``model_fn(*args, **kwargs)``.
+
+    Only single-model results are supported: formulas that produce several models
+    (e.g. via ``sw()``/``csw()`` or multiple dependent variables) raise a
+    ``ValueError``. This is checked upfront by parsing the formula, before
+    ``model_fn`` runs, and again on the returned object as a backstop.
+
+    Which metrics get logged depends on the model type (e.g. ``fepois`` has no R2):
+    ``_extract_metrics`` picks the relevant (metric_name, attribute) pairs based on
+    ``model_fn``. Metrics are logged to MLflow together with the coefficient table.
+    The object returned by ``model_fn`` is returned unchanged.
+
+    Only key parameters are logged: the formula, the data's shape, and vcov.
     """
     model_fn = _resolve_model_fn(model_fn)
 
@@ -41,19 +98,34 @@ def run_experiment(
 
     with mlflow.start_run(run_name=run_name, tags=tags):
         mlflow.log_param("model_fn", getattr(model_fn, "__name__", str(model_fn)))
-        for i, value in enumerate(args):
-            _log_param(f"arg_{i}", value)
-        for key, value in kwargs.items():
-            _log_param(key, value)
 
-        result = model_fn(*args, **kwargs)
+        bound_args = _bind_args(model_fn, args, kwargs)
 
-        fits = result.to_list() if hasattr(result, "to_list") else [result]
-        multiple = len(fits) > 1
-        for i, fit in enumerate(fits):
-            _log_fit(fit, prefix=f"model{i}_" if multiple else "")
+        fml = bound_args.get("fml")
+        if fml is not None:
+            mlflow.log_param("fml", fml)
+            if len(Formula.parse(fml)) > 1:
+                raise ValueError(_MULTI_MODEL_ERROR)
 
-    return result
+        data = bound_args.get("data")
+        if isinstance(data, pd.DataFrame):
+            mlflow.log_param("data_shape", str(data.shape))
+
+        vcov = bound_args.get("vcov")
+        if vcov is not None:
+            mlflow.log_param("vcov", str(vcov))
+
+        fit = model_fn(*args, **kwargs)
+
+        if isinstance(fit, FixestMulti):
+            raise ValueError(_MULTI_MODEL_ERROR)
+
+        mlflow.log_metrics(_extract_metrics(fit, model_fn))
+
+        coef_table = fit.tidy().reset_index()
+        mlflow.log_table(coef_table, artifact_file="coefficients.json")
+
+    return fit
 
 
 def _resolve_model_fn(model_fn: Callable[..., Any] | str) -> Callable[..., Any]:
@@ -63,22 +135,3 @@ def _resolve_model_fn(model_fn: Callable[..., Any] | str) -> Callable[..., Any]:
     if not callable(resolved):
         raise ValueError(f"Unknown pyfixest model function: {model_fn!r}")
     return resolved
-
-
-def _log_param(key: str, value: Any) -> None:
-    if isinstance(value, pd.DataFrame):
-        mlflow.log_param(f"{key}_shape", str(value.shape))
-    elif isinstance(value, (str, int, float, bool)) or value is None:
-        mlflow.log_param(key, value)
-    else:
-        mlflow.log_param(key, repr(value))
-
-
-def _log_fit(fit: Any, prefix: str) -> None:
-    for metric_name, attr in _METRIC_ATTRS.items():
-        value = getattr(fit, attr, None)
-        if value is not None:
-            mlflow.log_metric(f"{prefix}{metric_name}", float(value))
-
-    coef_table = fit.tidy().reset_index()
-    mlflow.log_table(coef_table, artifact_file=f"{prefix}coefficients.json")
