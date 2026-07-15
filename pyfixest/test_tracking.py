@@ -104,6 +104,23 @@ def test_run_experiment_logs_feglm_metrics(tmp_path):
     assert "pseudo_r2" not in metrics
 
 
+def test_run_experiment_logs_quantreg_metrics(tmp_path):
+    mlflow.set_tracking_uri(f"sqlite:///{tmp_path}/mlflow.db")
+    data = pf.get_data()
+
+    fit = run_experiment(
+        "Y ~ X1 + X2",
+        data=data,
+        model_fn=pf.quantreg,
+        experiment_name="quantreg-model-fn",
+    )
+
+    run = mlflow.last_active_run()
+    metrics = run.data.metrics
+    assert run.data.params["model_fn"] == "quantreg"
+    assert metrics == {"nobs": fit._N}
+
+
 def test_run_experiment_accepts_model_fn_as_string(tmp_path):
     mlflow.set_tracking_uri(f"sqlite:///{tmp_path}/mlflow.db")
     data = pf.get_data(model="Fepois")
