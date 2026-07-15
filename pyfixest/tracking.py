@@ -21,13 +21,19 @@ def _extract_metrics(fit: Any, model_fn: Callable[..., Any]) -> dict[str, float]
     """Read the metrics relevant to model_fn off fit via direct access.
 
     Metrics are pyfixest internals without a stable public getter, and not every
-    attribute applies to every model type (e.g. fepois has no F-statistic), so a
-    missing attribute is skipped rather than treated as an error.
+    attribute applies to every model type (e.g. fepois/feglm have no F-statistic,
+    feglm has no pseudo R2 either), so a missing attribute is skipped rather than
+    treated as an error.
     """
     if model_fn is pf.fepois:
         attrs = (
             ("nobs", "_N"),
             ("pseudo_r2", "_pseudo_r2"),
+            ("deviance", "deviance"),
+        )
+    elif model_fn is pf.feglm:
+        attrs = (
+            ("nobs", "_N"),
             ("deviance", "deviance"),
         )
     else:
@@ -67,8 +73,9 @@ def run_experiment(
     """Call a pyfixest modeling function inside a tracked MLflow run.
 
     ``model_fn`` (default ``pyfixest.feols``) is either a pyfixest modeling function
-    (e.g. ``pyfixest.fepois``) or its name as a string (e.g. ``"fepois"``), resolved
-    via ``getattr(pyfixest, model_fn)``. It is called as ``model_fn(*args, **kwargs)``.
+    (e.g. ``pyfixest.fepois``, ``pyfixest.feglm``) or its name as a string (e.g.
+    ``"fepois"``), resolved via ``getattr(pyfixest, model_fn)``. It is called as
+    ``model_fn(*args, **kwargs)``.
 
     Only single-model results are supported: formulas that produce several models
     (e.g. via ``sw()``/``csw()`` or multiple dependent variables) raise a

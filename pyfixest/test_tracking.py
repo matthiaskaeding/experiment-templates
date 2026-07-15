@@ -81,6 +81,29 @@ def test_run_experiment_accepts_explicit_model_fn(tmp_path):
     assert "f_statistic" not in metrics
 
 
+def test_run_experiment_logs_feglm_metrics(tmp_path):
+    mlflow.set_tracking_uri(f"sqlite:///{tmp_path}/mlflow.db")
+    data = pf.get_data(model="Fepois")
+    data["Y_bin"] = (data["Y"] > data["Y"].median()).astype(int)
+
+    fit = run_experiment(
+        "Y_bin ~ X1 + X2",
+        data=data,
+        model_fn=pf.feglm,
+        family="logit",
+        experiment_name="feglm-model-fn",
+    )
+
+    run = mlflow.last_active_run()
+    metrics = run.data.metrics
+    assert run.data.params["model_fn"] == "feglm"
+    assert metrics["nobs"] == fit._N
+    assert metrics["deviance"] == fit.deviance
+    assert "r2" not in metrics
+    assert "f_statistic" not in metrics
+    assert "pseudo_r2" not in metrics
+
+
 def test_run_experiment_accepts_model_fn_as_string(tmp_path):
     mlflow.set_tracking_uri(f"sqlite:///{tmp_path}/mlflow.db")
     data = pf.get_data(model="Fepois")
