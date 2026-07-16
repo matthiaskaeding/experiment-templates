@@ -20,6 +20,17 @@ _MULTI_MODEL_ERROR = (
     "multiple models (e.g. via sw()/csw() or multiple dependent variables)."
 )
 
+# MLflow always auto-creates a "Default" experiment with this reserved id, and
+# silently falls back to it when no experiment is active. run_experiment treats
+# that as a mistake rather than logging there (see the guard below).
+_DEFAULT_EXPERIMENT_ID = "0"
+_NO_EXPERIMENT_ERROR = (
+    "No MLflow experiment is set; this run would land in the implicit 'Default' "
+    "experiment. Pass experiment_name=... to run_experiment, or call "
+    "mlflow.set_experiment(...) beforehand. (The 'Default' experiment is not "
+    "supported as a logging target.)"
+)
+
 
 def _extract_metrics(fit: Any) -> dict[str, float]:
     """Read the metrics relevant to ``fit`` off it via direct access.
@@ -113,6 +124,13 @@ def run_experiment(
     object returned by ``model_fn`` is returned unchanged.
 
     Only key parameters are logged: the formula, the data's shape, and vcov.
+
+    ``experiment_name`` is optional: if omitted, the run uses whatever experiment is
+    already active (e.g. set once via ``mlflow.set_experiment(...)`` at the top of a
+    script). If that resolves to MLflow's implicit "Default" experiment -- because
+    nothing was set -- a ``ValueError`` is raised instead of logging there, and no
+    run is left behind. The "Default" experiment is not supported as a target even
+    if selected deliberately; use a named experiment.
     """
     model_fn = _resolve_model_fn(model_fn)
 
@@ -129,7 +147,17 @@ def run_experiment(
     if experiment_name is not None:
         mlflow.set_experiment(experiment_name)
 
-    with mlflow.start_run(run_name=run_name, tags=tags):
+    with mlflow.start_run(run_name=run_name, tags=tags) as run:
+        # If no experiment_name was given and nothing was set beforehand, the run
+        # lands in MLflow's implicit "Default" experiment. Reject that -- but the
+        # run is already open, so end and delete it first, otherwise the guard
+        # would itself leave a FAILED run in Default (the pollution it prevents).
+        if experiment_name is None and run.info.experiment_id == _DEFAULT_EXPERIMENT_ID:
+            run_id = run.info.run_id
+            mlflow.end_run()
+            mlflow.delete_run(run_id)
+            raise ValueError(_NO_EXPERIMENT_ERROR)
+
         mlflow.log_param("model_fn", getattr(model_fn, "__name__", str(model_fn)))
         if fml is not None:
             mlflow.log_param("fml", fml)

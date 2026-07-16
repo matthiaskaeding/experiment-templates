@@ -148,6 +148,31 @@ def test_run_experiment_rejects_unknown_model_fn_string():
         run_experiment("Y ~ X1", data=pf.get_data(), model_fn="not_a_real_model_fn")
 
 
+def test_run_experiment_errors_when_no_experiment_set(tmp_path):
+    mlflow.set_tracking_uri(f"sqlite:///{tmp_path}/mlflow.db")
+    # MLflow's active experiment is process-global, so point at this store's own
+    # Default experiment to be deterministic regardless of what ran before.
+    mlflow.set_experiment("Default")
+
+    with pytest.raises(ValueError, match="No MLflow experiment is set"):
+        run_experiment("Y ~ X1 + X2", data=pf.get_data())
+
+    # The guard must not itself leave a FAILED run behind in Default.
+    assert mlflow.search_runs(search_all_experiments=True).empty
+
+
+def test_run_experiment_reuses_already_active_experiment(tmp_path):
+    mlflow.set_tracking_uri(f"sqlite:///{tmp_path}/mlflow.db")
+    mlflow.set_experiment("already-set")
+
+    fit = run_experiment("Y ~ X1 + X2", data=pf.get_data())
+
+    run = mlflow.last_active_run()
+    experiment = mlflow.get_experiment(run.info.experiment_id)
+    assert experiment.name == "already-set"
+    assert fit._r2 is not None
+
+
 def test_run_experiment_logs_etable_summary_artifact(tmp_path):
     mlflow.set_tracking_uri(f"sqlite:///{tmp_path}/mlflow.db")
     data = pf.get_data()
