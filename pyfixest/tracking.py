@@ -79,11 +79,13 @@ def run_experiment(
     as a string (e.g. ``"fepois"``), resolved via ``getattr(pyfixest, model_fn)``. It
     is called as ``model_fn(*args, **kwargs)``.
 
-    Only single-model results are supported: formulas that produce several models
-    (e.g. via ``sw()``/``csw()`` or multiple dependent variables) raise a
-    ``ValueError``. This is checked upfront by parsing the formula, before any
-    MLflow run is opened, so an invalid formula never leaves a FAILED run behind;
-    the returned object is also checked as a backstop.
+    All input validation happens before the MLflow run is opened, so a bad input
+    never leaves a FAILED run behind: binding the call arguments (a signature
+    mismatch raises ``TypeError``) and parsing the formula (a malformed formula
+    raises ``FormulaSyntaxError``) both run first. In particular, only single-model
+    results are supported: formulas that produce several models (e.g. via
+    ``sw()``/``csw()`` or multiple dependent variables) raise a ``ValueError``
+    before any run is opened; the returned object is also checked as a backstop.
 
     Which metrics get logged depends on the model type (e.g. ``fepois`` has no R2):
     ``_extract_metrics`` picks the relevant (metric_name, attribute) pairs based on
