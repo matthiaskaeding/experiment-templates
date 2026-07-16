@@ -10,14 +10,14 @@ from there.
 
 ```python
 import mlflow
-from tracking import run_experiment
+from tracking import regress
 
 mlflow.set_experiment("my-analysis")   # once per script
 
-fit = run_experiment("Y ~ X1 + X2", data=df, vcov="hetero")
+fit = regress("Y ~ X1 + X2", data=df, vcov="hetero")
 ```
 
-`experiment_name` is an optional per-call override. The normal pattern is to
+`name` is an optional per-call experiment override. The normal pattern is to
 call `mlflow.set_experiment(...)` once at the top of the script (or set the
 `MLFLOW_EXPERIMENT_NAME` environment variable) and let runs land in the active
 experiment. `model_fn` accepts a pyfixest function or its name as a string, e.g.

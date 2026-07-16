@@ -38,3 +38,29 @@ jobs:
       # pyproject.toml rather than hardcoding a folder.
       - name: Pytest
         run: uv run pytest
+
+  notebook:
+    # Re-execute the example notebook and fail if it drifts from what's
+    # committed. Outputs are non-deterministic (run ids, artifact paths,
+    # timestamps), so the notebook is committed with outputs stripped and this
+    # job strips again after executing: the diff then catches either an
+    # execution error (jupyter execute exits non-zero) or an un-committed code
+    # change, without false positives from volatile output.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Install dependencies (including dev group)
+        run: uv sync --dev
+
+      - name: Execute notebook and check it is in sync
+        working-directory: pyfixest-regression
+        run: |
+          uv run jupyter execute example.ipynb --output=example.ipynb
+          uv run nbstripout example.ipynb
+          git diff --exit-code -- example.ipynb
