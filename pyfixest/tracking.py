@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import inspect
+import warnings
 from typing import Any, Callable
 
 import mlflow
@@ -89,8 +90,10 @@ def run_experiment(
 
     Which metrics get logged depends on the model type (e.g. ``fepois`` has no R2):
     ``_extract_metrics`` picks the relevant (metric_name, attribute) pairs based on
-    ``model_fn``. Metrics are logged to MLflow together with the coefficient table.
-    The object returned by ``model_fn`` is returned unchanged.
+    ``model_fn``. Metrics are logged to MLflow together with the coefficient table
+    and, when the model type supports it, a human-readable regression table
+    (pyfixest ``etable``) as a ``summary.html`` artifact. The object returned by
+    ``model_fn`` is returned unchanged.
 
     Only key parameters are logged: the formula, the data's shape, and vcov.
     """
@@ -127,6 +130,19 @@ def run_experiment(
 
         coef_table = fit.tidy().reset_index()
         mlflow.log_table(coef_table, artifact_file="coefficients.json")
+
+        # A human-readable regression table, alongside the tidy coefficients, to
+        # eyeball runs in the MLflow UI. The summary is a nice-to-have, not the
+        # point of the run, so the whole block is failure-safe: both etable
+        # generation (not every model type is guaranteed to be supported) and the
+        # log_text upload are caught, so neither can fail the run or lose the fit.
+        # (The metric and coefficient-table logging above is deliberately not
+        # wrapped -- those failing should surface.)
+        try:
+            summary_html = pf.etable([fit], type="html")
+            mlflow.log_text(summary_html, "summary.html")
+        except Exception as exc:
+            warnings.warn(f"Could not log etable summary: {exc}", stacklevel=2)
 
     return fit
 

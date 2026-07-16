@@ -144,3 +144,32 @@ def test_run_experiment_accepts_model_fn_as_string(tmp_path):
 def test_run_experiment_rejects_unknown_model_fn_string():
     with pytest.raises(ValueError, match="not_a_real_model_fn"):
         run_experiment("Y ~ X1", data=pf.get_data(), model_fn="not_a_real_model_fn")
+
+
+def test_run_experiment_logs_etable_summary_artifact(tmp_path):
+    mlflow.set_tracking_uri(f"sqlite:///{tmp_path}/mlflow.db")
+    data = pf.get_data()
+
+    run_experiment("Y ~ X1 + X2", data=data, experiment_name="etable-summary")
+
+    run = mlflow.last_active_run()
+    artifacts = mlflow.artifacts.list_artifacts(run_id=run.info.run_id)
+    paths = {a.path for a in artifacts}
+    assert "summary.html" in paths
+
+
+def test_run_experiment_completes_when_etable_fails(tmp_path, monkeypatch):
+    mlflow.set_tracking_uri(f"sqlite:///{tmp_path}/mlflow.db")
+    data = pf.get_data()
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("etable exploded")
+
+    monkeypatch.setattr(pf, "etable", boom)
+
+    with pytest.warns(UserWarning, match="Could not log etable summary"):
+        fit = run_experiment("Y ~ X1 + X2", data=data, experiment_name="etable-failure")
+
+    run = mlflow.last_active_run()
+    assert "nobs" in run.data.metrics
+    assert fit._r2 is not None
