@@ -18,17 +18,17 @@ from pyfixest.estimation.quantreg.quantreg_ import Quantreg
 from hashing import compute_experiment_hash
 
 _MULTI_MODEL_ERROR = (
-    "run_experiment only supports single-model results; the formula produced "
+    "regress only supports single-model results; the formula produced "
     "multiple models (e.g. via sw()/csw() or multiple dependent variables)."
 )
 
 # MLflow always auto-creates a "Default" experiment with this reserved id, and
-# silently falls back to it when no experiment is active. run_experiment treats
+# silently falls back to it when no experiment is active. regress treats
 # that as a mistake rather than logging there (see the guard below).
 _DEFAULT_EXPERIMENT_ID = "0"
 _NO_EXPERIMENT_ERROR = (
     "No MLflow experiment is set; this run would land in the implicit 'Default' "
-    "experiment. Pass experiment_name=... to run_experiment, or call "
+    "experiment. Pass name=... to regress, or call "
     "mlflow.set_experiment(...) beforehand. (The 'Default' experiment is not "
     "supported as a logging target.)"
 )
@@ -109,10 +109,10 @@ def _already_logged(experiment_hash: str) -> bool:
     return not runs.empty
 
 
-def run_experiment(
+def regress(
     *args: Any,
     model_fn: Callable[..., Any] | str = pf.feols,
-    experiment_name: str | None = None,
+    name: str | None = None,
     run_name: str | None = None,
     tags: dict[str, str] | None = None,
     global_version: str = "0",
@@ -142,7 +142,7 @@ def run_experiment(
 
     Only key parameters are logged: the formula, the data's shape, and vcov.
 
-    ``experiment_name`` is optional: if omitted, the run uses whatever experiment is
+    ``name`` is optional: if omitted, the run uses whatever experiment is
     already active (e.g. set once via ``mlflow.set_experiment(...)`` at the top of a
     script). If that resolves to MLflow's implicit "Default" experiment -- because
     nothing was set -- a ``ValueError`` is raised instead of logging there, and no
@@ -169,8 +169,8 @@ def run_experiment(
     if fml is not None and len(Formula.parse(fml)) > 1:
         raise ValueError(_MULTI_MODEL_ERROR)
 
-    if experiment_name is not None:
-        mlflow.set_experiment(experiment_name)
+    if name is not None:
+        mlflow.set_experiment(name)
 
     experiment_hash = None
     if isinstance(data, pd.DataFrame):
@@ -189,11 +189,11 @@ def run_experiment(
         return fit
 
     with mlflow.start_run(run_name=run_name, tags=tags) as run:
-        # If no experiment_name was given and nothing was set beforehand, the run
+        # If no name was given and nothing was set beforehand, the run
         # lands in MLflow's implicit "Default" experiment. Reject that -- but the
         # run is already open, so end and delete it first, otherwise the guard
         # would itself leave a FAILED run in Default (the pollution it prevents).
-        if experiment_name is None and run.info.experiment_id == _DEFAULT_EXPERIMENT_ID:
+        if name is None and run.info.experiment_id == _DEFAULT_EXPERIMENT_ID:
             run_id = run.info.run_id
             mlflow.end_run()
             mlflow.delete_run(run_id)
