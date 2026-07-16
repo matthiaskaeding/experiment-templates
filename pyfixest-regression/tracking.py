@@ -15,6 +15,8 @@ from pyfixest.estimation.models.feglm_ import Feglm
 from pyfixest.estimation.models.fepois_ import Fepois
 from pyfixest.estimation.quantreg.quantreg_ import Quantreg
 
+from hashing import compute_experiment_hash
+
 _MULTI_MODEL_ERROR = (
     "run_experiment only supports single-model results; the formula produced "
     "multiple models (e.g. via sw()/csw() or multiple dependent variables)."
@@ -93,12 +95,27 @@ def _bind_args(
     return bound.arguments
 
 
+def _already_logged(experiment_hash: str) -> bool:
+    """Whether a run with this experiment_hash exists in the active experiment.
+
+    ``mlflow.search_runs`` with no experiment argument searches only the currently
+    active experiment, so deduplication is scoped to that experiment: the same
+    inputs logged under a different experiment are not considered duplicates.
+    """
+    runs = mlflow.search_runs(
+        filter_string=f"params.experiment_hash = '{experiment_hash}'",
+        max_results=1,
+    )
+    return not runs.empty
+
+
 def run_experiment(
     *args: Any,
     model_fn: Callable[..., Any] | str = pf.feols,
     experiment_name: str | None = None,
     run_name: str | None = None,
     tags: dict[str, str] | None = None,
+    global_version: str = "0",
     **kwargs: Any,
 ) -> Any:
     """Call a pyfixest modeling function inside a tracked MLflow run.
@@ -131,6 +148,14 @@ def run_experiment(
     nothing was set -- a ``ValueError`` is raised instead of logging there, and no
     run is left behind. The "Default" experiment is not supported as a target even
     if selected deliberately; use a named experiment.
+
+    Deduplication: when ``data`` is a DataFrame, a content hash of (data, model
+    params including ``model_fn``, ``global_version``) is computed via
+    ``compute_experiment_hash`` and logged as the ``experiment_hash`` param. Before
+    logging, the active experiment is checked for a run with that same hash; if one
+    exists, this call skips logging entirely (no duplicate run is created). The
+    model is *always* re-fitted and returned either way -- only the MLflow logging
+    is skipped -- since MLflow stores metrics/artifacts, not the live fit object.
     """
     model_fn = _resolve_model_fn(model_fn)
 
@@ -147,6 +172,22 @@ def run_experiment(
     if experiment_name is not None:
         mlflow.set_experiment(experiment_name)
 
+    experiment_hash = None
+    if isinstance(data, pd.DataFrame):
+        model_params = {k: v for k, v in bound_args.items() if k != "data"}
+        model_params["model_fn"] = getattr(model_fn, "__name__", str(model_fn))
+        experiment_hash = compute_experiment_hash(data, model_params, global_version)
+
+    fit = model_fn(*args, **kwargs)
+
+    if isinstance(fit, FixestMulti):
+        raise ValueError(_MULTI_MODEL_ERROR)
+
+    # Skip logging (no new run) if an identical experiment was already logged in
+    # the active experiment; the freshly fitted model is still returned.
+    if experiment_hash is not None and _already_logged(experiment_hash):
+        return fit
+
     with mlflow.start_run(run_name=run_name, tags=tags) as run:
         # If no experiment_name was given and nothing was set beforehand, the run
         # lands in MLflow's implicit "Default" experiment. Reject that -- but the
@@ -159,17 +200,14 @@ def run_experiment(
             raise ValueError(_NO_EXPERIMENT_ERROR)
 
         mlflow.log_param("model_fn", getattr(model_fn, "__name__", str(model_fn)))
+        if experiment_hash is not None:
+            mlflow.log_param("experiment_hash", experiment_hash)
         if fml is not None:
             mlflow.log_param("fml", fml)
         if isinstance(data, pd.DataFrame):
             mlflow.log_param("data_shape", str(data.shape))
         if vcov is not None:
             mlflow.log_param("vcov", str(vcov))
-
-        fit = model_fn(*args, **kwargs)
-
-        if isinstance(fit, FixestMulti):
-            raise ValueError(_MULTI_MODEL_ERROR)
 
         mlflow.log_metrics(_extract_metrics(fit))
 

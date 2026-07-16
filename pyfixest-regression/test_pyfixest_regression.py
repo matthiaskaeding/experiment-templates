@@ -4,6 +4,7 @@ import mlflow
 import pyfixest as pf
 import pytest
 
+from hashing import compute_experiment_hash
 from tracking import _extract_metrics, run_experiment
 
 
@@ -246,3 +247,146 @@ def test_run_experiment_dispatches_on_fit_type_not_function_identity(tmp_path):
     assert metrics["pseudo_r2"] == fit._pseudo_r2
     assert "r2" not in metrics
     assert "f_statistic" not in metrics
+
+
+# --- hashing ---
+
+
+def test_same_inputs_give_same_hash():
+    data = pf.get_data()
+    params = {"fml": "Y ~ X1 + X2", "vcov": "iid"}
+
+    h1 = compute_experiment_hash(data, params, global_version="v1")
+    h2 = compute_experiment_hash(data.copy(), dict(params), global_version="v1")
+
+    assert h1 == h2
+
+
+def test_changed_data_changes_hash():
+    data = pf.get_data()
+    params = {"fml": "Y ~ X1 + X2", "vcov": "iid"}
+
+    h1 = compute_experiment_hash(data, params, global_version="v1")
+    changed = data.copy()
+    changed["X1"] = changed["X1"] + 1
+    h2 = compute_experiment_hash(changed, params, global_version="v1")
+
+    assert h1 != h2
+
+
+def test_changed_model_params_changes_hash():
+    data = pf.get_data()
+
+    h1 = compute_experiment_hash(
+        data, {"fml": "Y ~ X1 + X2", "vcov": "iid"}, global_version="v1"
+    )
+    h2 = compute_experiment_hash(
+        data, {"fml": "Y ~ X1", "vcov": "iid"}, global_version="v1"
+    )
+
+    assert h1 != h2
+
+
+def test_changed_model_fn_changes_hash():
+    # The modeling function participates in the hash, so the same data + formula
+    # under different estimators must not collide (previously they did).
+    data = pf.get_data()
+    base = {"fml": "Y ~ X1 + X2", "vcov": "iid"}
+
+    h_feols = compute_experiment_hash(
+        data, {**base, "model_fn": "feols"}, global_version="v1"
+    )
+    h_quantreg = compute_experiment_hash(
+        data, {**base, "model_fn": "quantreg"}, global_version="v1"
+    )
+
+    assert h_feols != h_quantreg
+
+
+def test_changed_global_version_changes_hash():
+    data = pf.get_data()
+    params = {"fml": "Y ~ X1 + X2", "vcov": "iid"}
+
+    h1 = compute_experiment_hash(data, params, global_version="v1")
+    h2 = compute_experiment_hash(data, params, global_version="v2")
+
+    assert h1 != h2
+
+
+def test_model_params_key_order_does_not_change_hash():
+    data = pf.get_data()
+
+    h1 = compute_experiment_hash(
+        data, {"fml": "Y ~ X1 + X2", "vcov": "iid"}, global_version="v1"
+    )
+    h2 = compute_experiment_hash(
+        data, {"vcov": "iid", "fml": "Y ~ X1 + X2"}, global_version="v1"
+    )
+
+    assert h1 == h2
+
+
+# --- dedup wiring ---
+
+
+def test_run_experiment_logs_experiment_hash(tmp_path):
+    mlflow.set_tracking_uri(f"sqlite:///{tmp_path}/mlflow.db")
+    data = pf.get_data()
+
+    run_experiment(
+        "Y ~ X1 + X2", data=data, global_version="v1", experiment_name="hash-logging"
+    )
+
+    run = mlflow.last_active_run()
+    assert "experiment_hash" in run.data.params
+
+
+def test_run_experiment_skips_duplicate_run_but_returns_model(tmp_path):
+    mlflow.set_tracking_uri(f"sqlite:///{tmp_path}/mlflow.db")
+    data = pf.get_data()
+
+    fit1 = run_experiment(
+        "Y ~ X1 + X2", data=data, global_version="v1", experiment_name="dedup"
+    )
+    assert len(mlflow.search_runs(experiment_names=["dedup"])) == 1
+
+    fit2 = run_experiment(
+        "Y ~ X1 + X2", data=data, global_version="v1", experiment_name="dedup"
+    )
+    # Second call created no new run, but still returned a valid fitted model.
+    assert len(mlflow.search_runs(experiment_names=["dedup"])) == 1
+    assert fit2._r2 == fit1._r2
+
+
+def test_run_experiment_different_global_version_is_not_a_duplicate(tmp_path):
+    mlflow.set_tracking_uri(f"sqlite:///{tmp_path}/mlflow.db")
+    data = pf.get_data()
+
+    run_experiment(
+        "Y ~ X1 + X2", data=data, global_version="v1", experiment_name="versions"
+    )
+    run_experiment(
+        "Y ~ X1 + X2", data=data, global_version="v2", experiment_name="versions"
+    )
+
+    assert len(mlflow.search_runs(experiment_names=["versions"])) == 2
+
+
+def test_run_experiment_different_model_fn_is_not_a_duplicate(tmp_path):
+    # Regression test for the hash-ignores-model_fn bug: same data + formula but
+    # different estimators must both be logged, not deduplicated.
+    mlflow.set_tracking_uri(f"sqlite:///{tmp_path}/mlflow.db")
+    data = pf.get_data()
+
+    run_experiment(
+        "Y ~ X1 + X2", data=data, experiment_name="model-fn-dedup", global_version="v1"
+    )
+    run_experiment(
+        "Y ~ X1 + X2",
+        data=data,
+        model_fn=pf.quantreg,
+        experiment_name="model-fn-dedup",
+        global_version="v1",
+    )
+
+    assert len(mlflow.search_runs(experiment_names=["model-fn-dedup"])) == 2
