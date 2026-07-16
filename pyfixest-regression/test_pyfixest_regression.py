@@ -1,8 +1,10 @@
+import warnings
+
 import mlflow
 import pyfixest as pf
 import pytest
 
-from tracking import run_experiment
+from tracking import _extract_metrics, run_experiment
 
 
 def test_run_experiment_logs_single_model(tmp_path):
@@ -173,3 +175,49 @@ def test_run_experiment_completes_when_etable_fails(tmp_path, monkeypatch):
     run = mlflow.last_active_run()
     assert "nobs" in run.data.metrics
     assert fit._r2 is not None
+
+
+def test_extract_metrics_warns_on_missing_attribute():
+    class FakeFit:
+        _N = 123.0
+
+    fit = FakeFit()  # not a pyfixest result -> hits the default (feols) branch
+    with pytest.warns(UserWarning):
+        metrics = _extract_metrics(fit)
+
+    assert metrics == {"nobs": 123.0}
+
+
+def test_extract_metrics_no_warning_for_optional_missing_f_statistic():
+    # A fixed-effects-only feols legitimately has no _f_statistic. Because that
+    # metric is marked optional, extracting metrics must not emit any warning.
+    data = pf.get_data()
+    fit = pf.feols("Y ~ 1 | f1", data=data)
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", UserWarning)
+        metrics = _extract_metrics(fit)
+
+    assert "nobs" in metrics
+    assert "f_statistic" not in metrics
+
+
+def test_run_experiment_dispatches_on_fit_type_not_function_identity(tmp_path):
+    mlflow.set_tracking_uri(f"sqlite:///{tmp_path}/mlflow.db")
+    data = pf.get_data(model="Fepois")
+
+    def fepois_wrapper(*args, **kwargs):
+        return pf.fepois(*args, **kwargs)
+
+    fit = run_experiment(
+        "Y ~ X1 + X2",
+        data=data,
+        model_fn=fepois_wrapper,
+        experiment_name="wrapper-model-fn",
+    )
+
+    run = mlflow.last_active_run()
+    metrics = run.data.metrics
+    assert metrics["pseudo_r2"] == fit._pseudo_r2
+    assert "r2" not in metrics
+    assert "f_statistic" not in metrics

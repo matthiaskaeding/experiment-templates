@@ -11,6 +11,9 @@ import pandas as pd
 import pyfixest as pf
 from pyfixest.estimation.FixestMulti_ import FixestMulti
 from pyfixest.estimation.formula.parse import Formula
+from pyfixest.estimation.models.feglm_ import Feglm
+from pyfixest.estimation.models.fepois_ import Fepois
+from pyfixest.estimation.quantreg.quantreg_ import Quantreg
 
 _MULTI_MODEL_ERROR = (
     "run_experiment only supports single-model results; the formula produced "
@@ -18,42 +21,56 @@ _MULTI_MODEL_ERROR = (
 )
 
 
-def _extract_metrics(fit: Any, model_fn: Callable[..., Any]) -> dict[str, float]:
-    """Read the metrics relevant to model_fn off fit via direct access.
+def _extract_metrics(fit: Any) -> dict[str, float]:
+    """Read the metrics relevant to ``fit`` off it via direct access.
 
-    Metrics are pyfixest internals without a stable public getter, and not every
-    attribute applies to every model type (e.g. fepois/feglm/quantreg have no
-    F-statistic, feglm has no pseudo R2 either, and quantreg has no R2 at all), so
-    a missing attribute is skipped rather than treated as an error.
+    Dispatch is on the *type* of the fitted result, not on the modeling function,
+    so a user-supplied wrapper around a pyfixest estimator still gets the right
+    metrics. ``Fepois``, ``Feglm`` (logit/probit), and ``Quantreg`` are all
+    subclasses of ``Feols``, so the ``isinstance`` checks run most specific first
+    and fall back to the ``Feols``-style metrics.
+
+    Each entry is ``(metric_name, attribute, required)``. These metrics are
+    pyfixest internals without a stable public getter, so a *required* attribute
+    that is missing (or non-numeric) is skipped with a ``warnings.warn`` -- if
+    pyfixest renames one, the warning surfaces it. *Optional* attributes are
+    legitimately absent for some specifications (e.g. ``_f_statistic`` is unset for
+    IV or fixed-effects-only feols, where there is nothing to test) and are skipped
+    silently, so normal runs don't emit spurious warnings.
     """
-    if model_fn is pf.fepois:
+    if isinstance(fit, Quantreg):
+        attrs = (("nobs", "_N", True),)
+    elif isinstance(fit, Fepois):
         attrs = (
-            ("nobs", "_N"),
-            ("pseudo_r2", "_pseudo_r2"),
-            ("deviance", "deviance"),
+            ("nobs", "_N", True),
+            ("pseudo_r2", "_pseudo_r2", True),
+            ("deviance", "deviance", True),
         )
-    elif model_fn is pf.feglm:
+    elif isinstance(fit, Feglm):
         attrs = (
-            ("nobs", "_N"),
-            ("deviance", "deviance"),
+            ("nobs", "_N", True),
+            ("deviance", "deviance", True),
         )
-    elif model_fn is pf.quantreg:
-        attrs = (("nobs", "_N"),)
     else:
         attrs = (
-            ("nobs", "_N"),
-            ("r2", "_r2"),
-            ("adj_r2", "_adj_r2"),
-            ("f_statistic", "_f_statistic"),
-            ("rmse", "_rmse"),
+            ("nobs", "_N", True),
+            ("r2", "_r2", True),
+            ("adj_r2", "_adj_r2", True),
+            ("f_statistic", "_f_statistic", False),
+            ("rmse", "_rmse", True),
         )
 
     metrics = {}
-    for name, attr in attrs:
+    for name, attr, required in attrs:
         try:
             metrics[name] = float(getattr(fit, attr))
-        except AttributeError:
-            pass
+        except (AttributeError, TypeError, ValueError) as exc:
+            if required:
+                warnings.warn(
+                    f"Could not extract metric {name!r} from "
+                    f"{type(fit).__name__} (attribute {attr!r}): {exc!r}; skipping.",
+                    stacklevel=2,
+                )
     return metrics
 
 
@@ -90,10 +107,10 @@ def run_experiment(
 
     Which metrics get logged depends on the model type (e.g. ``fepois`` has no R2):
     ``_extract_metrics`` picks the relevant (metric_name, attribute) pairs based on
-    ``model_fn``. Metrics are logged to MLflow together with the coefficient table
-    and, when the model type supports it, a human-readable regression table
-    (pyfixest ``etable``) as a ``summary.html`` artifact. The object returned by
-    ``model_fn`` is returned unchanged.
+    the type of the fitted result. Metrics are logged to MLflow together with the
+    coefficient table and, when the model type supports it, a human-readable
+    regression table (pyfixest ``etable``) as a ``summary.html`` artifact. The
+    object returned by ``model_fn`` is returned unchanged.
 
     Only key parameters are logged: the formula, the data's shape, and vcov.
     """
@@ -126,7 +143,7 @@ def run_experiment(
         if isinstance(fit, FixestMulti):
             raise ValueError(_MULTI_MODEL_ERROR)
 
-        mlflow.log_metrics(_extract_metrics(fit, model_fn))
+        mlflow.log_metrics(_extract_metrics(fit))
 
         coef_table = fit.tidy().reset_index()
         mlflow.log_table(coef_table, artifact_file="coefficients.json")
