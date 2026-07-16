@@ -5,7 +5,7 @@ import pyfixest as pf
 import pytest
 
 from hashing import compute_experiment_hash
-from tracking import _extract_metrics, regress
+from tracking import _extract_metrics, regress, results_table
 
 
 def test_regress_logs_single_model(tmp_path):
@@ -376,3 +376,47 @@ def test_regress_different_model_fn_is_not_a_duplicate(tmp_path):
     )
 
     assert len(mlflow.search_runs(experiment_names=["model-fn-dedup"])) == 2
+
+
+# --- results_table ---
+
+
+def test_results_table_is_tidy_one_row_per_run(tmp_path):
+    mlflow.set_tracking_uri(f"sqlite:///{tmp_path}/mlflow.db")
+    data = pf.get_data()
+
+    regress("Y ~ X1 + X2", data=data, vcov="iid", name="rt")
+    regress("Y ~ X1 + X2", data=data, vcov="hetero", name="rt")
+
+    table = results_table("rt")
+
+    assert len(table) == 2
+    # params/metrics prefixes are stripped ...
+    for col in ("run_id", "fml", "vcov", "model_fn", "r2", "nobs"):
+        assert col in table.columns
+    # ... and MLflow bookkeeping / prefixed columns are gone
+    assert not any(
+        c.startswith("params.") or c.startswith("metrics.") for c in table.columns
+    )
+    assert "status" not in table.columns
+    assert set(table["vcov"]) == {"iid", "hetero"}
+
+
+def test_results_table_reads_active_experiment_by_default(tmp_path):
+    mlflow.set_tracking_uri(f"sqlite:///{tmp_path}/mlflow.db")
+    mlflow.set_experiment("active-default")
+    regress("Y ~ X1 + X2", data=pf.get_data())
+
+    table = results_table()
+
+    assert len(table) == 1
+    assert table["fml"].iloc[0] == "Y ~ X1 + X2"
+
+
+def test_results_table_empty_experiment_returns_empty(tmp_path):
+    mlflow.set_tracking_uri(f"sqlite:///{tmp_path}/mlflow.db")
+    mlflow.create_experiment("no-runs")
+
+    table = results_table("no-runs")
+
+    assert table.empty

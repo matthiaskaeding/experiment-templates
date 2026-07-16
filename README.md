@@ -10,11 +10,13 @@ from there.
 
 ```python
 import mlflow
-from tracking import regress
+from tracking import regress, results_table
 
 mlflow.set_experiment("my-analysis")   # once per script
 
 fit = regress("Y ~ X1 + X2", data=df, vcov="hetero")
+
+runs = results_table("my-analysis")    # one tidy row per logged run
 ```
 
 `name` is an optional per-call experiment override. The normal pattern is to
@@ -22,6 +24,10 @@ call `mlflow.set_experiment(...)` once at the top of the script (or set the
 `MLFLOW_EXPERIMENT_NAME` environment variable) and let runs land in the active
 experiment. `model_fn` accepts a pyfixest function or its name as a string, e.g.
 `model_fn="fepois"`; it defaults to `feols`.
+
+`results_table(experiment_name=None)` pulls the logged runs back as a tidy
+DataFrame (one row per run, params and metrics with prefixes stripped); with no
+argument it reads the active experiment.
 
 ## What gets logged
 
