@@ -60,6 +60,10 @@ def test_run_experiment_rejects_multi_model_formula_before_fitting(tmp_path):
             experiment_name="csw-formula-precheck",
         )
 
+    # The formula is rejected before any MLflow run is opened, so this fresh
+    # tracking store must contain no runs (no FAILED run left behind).
+    assert mlflow.search_runs(search_all_experiments=True).empty
+
 
 def test_run_experiment_accepts_explicit_model_fn(tmp_path):
     mlflow.set_tracking_uri(f"sqlite:///{tmp_path}/mlflow.db")
