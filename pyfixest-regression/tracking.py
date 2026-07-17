@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import inspect
+import re
 import warnings
 from typing import Any, Callable
 
@@ -94,6 +95,36 @@ def _bind_args(
     return bound.arguments
 
 
+def _log_coefficient_metrics(fit: Any, coefficients: str | list[str]) -> None:
+    """Log selected coefficients as first-class, searchable MLflow metrics.
+
+    For each requested coefficient present in ``fit.tidy()``, logs
+    ``coef.<name>.estimate``, ``coef.<name>.std_error``, and ``coef.<name>.pvalue``.
+    Coefficient names may contain characters MLflow disallows in metric keys
+    (e.g. ``C(f1)[T.1.0]``), so those are replaced with ``_`` in the key; a
+    requested name that is not in the model is skipped with a warning.
+    """
+    names = [coefficients] if isinstance(coefficients, str) else list(coefficients)
+    tidy = fit.tidy()
+    for coef_name in names:
+        if coef_name not in tidy.index:
+            warnings.warn(
+                f"log_coefficients: {coef_name!r} is not a coefficient of the "
+                f"fitted model; skipping.",
+                stacklevel=3,
+            )
+            continue
+        row = tidy.loc[coef_name]
+        key = re.sub(r"[^\w\-. /]", "_", coef_name)
+        mlflow.log_metrics(
+            {
+                f"coef.{key}.estimate": float(row["Estimate"]),
+                f"coef.{key}.std_error": float(row["Std. Error"]),
+                f"coef.{key}.pvalue": float(row["Pr(>|t|)"]),
+            }
+        )
+
+
 def _already_logged(experiment_hash: str) -> bool:
     """Whether a run with this experiment_hash exists in the active experiment.
 
@@ -116,6 +147,7 @@ def regress(
     experiment_id: str | None = None,
     tags: dict[str, str] | None = None,
     global_version: str = "0",
+    log_coefficients: str | list[str] | None = None,
     **kwargs: Any,
 ) -> Any:
     """Call a pyfixest modeling function inside a tracked MLflow run.
@@ -154,6 +186,15 @@ def regress(
     all -- the run would land in MLflow's implicit "Default" experiment -- a
     ``UserWarning`` is issued and logging proceeds there.
 
+    ``log_coefficients`` (a coefficient name or list of names) additionally logs
+    those coefficients as first-class, searchable metrics --
+    ``coef.<name>.estimate`` / ``.std_error`` / ``.pvalue`` -- so they can be
+    filtered and sorted in the MLflow store/UI (e.g.
+    ``search_runs(filter_string='metrics.`coef.X1.estimate` > 0')``). It is
+    deliberately opt-in and scoped: models can have hundreds of dummy or
+    fixed-effect coefficients, and all of them always remain available via the
+    ``coefficients.json`` artifact regardless.
+
     Deduplication: when ``data`` is a DataFrame, a content hash of (data, model
     params including ``model_fn``, ``global_version``) is computed via
     ``compute_experiment_hash`` and logged as the ``experiment_hash`` param. Before
@@ -161,6 +202,9 @@ def regress(
     exists, this call skips logging entirely (no duplicate run is created). The
     model is *always* re-fitted and returned either way -- only the MLflow logging
     is skipped -- since MLflow stores metrics/artifacts, not the live fit object.
+    Note that logging configuration (``log_coefficients``) is not part of the
+    hash: an experiment already logged without coefficient metrics will be
+    skipped as a duplicate; bump ``global_version`` to force a re-log.
     """
     model_fn = _resolve_model_fn(model_fn)
 
@@ -219,6 +263,9 @@ def regress(
             mlflow.log_param("vcov", str(vcov))
 
         mlflow.log_metrics(_extract_metrics(fit))
+
+        if log_coefficients is not None:
+            _log_coefficient_metrics(fit, log_coefficients)
 
         coef_table = fit.tidy().reset_index()
         mlflow.log_table(coef_table, artifact_file="coefficients.json")

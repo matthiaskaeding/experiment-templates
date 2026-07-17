@@ -519,3 +519,70 @@ def test_coefficients_table_empty_experiment_returns_empty(tmp_path):
     mlflow.create_experiment("ct-empty")
 
     assert coefficients_table("ct-empty").empty
+
+
+# --- log_coefficients ---
+
+
+def test_regress_logs_selected_coefficients_as_searchable_metrics(tmp_path):
+    mlflow.set_tracking_uri(f"sqlite:///{tmp_path}/mlflow.db")
+    data = pf.get_data()
+
+    fit = regress(
+        "Y ~ X1 + X2",
+        data=data,
+        experiment_name="coef-metrics",
+        log_coefficients=["X1"],
+    )
+
+    run = mlflow.last_active_run()
+    metrics = run.data.metrics
+    tidy = fit.tidy()
+    assert metrics["coef.X1.estimate"] == float(tidy.loc["X1", "Estimate"])
+    assert metrics["coef.X1.std_error"] == float(tidy.loc["X1", "Std. Error"])
+    assert metrics["coef.X1.pvalue"] == float(tidy.loc["X1", "Pr(>|t|)"])
+    # unselected coefficients are not logged as metrics
+    assert "coef.X2.estimate" not in metrics
+
+    # the point of first-class logging: filterable in the MLflow store
+    hits = mlflow.search_runs(
+        experiment_names=["coef-metrics"],
+        filter_string="metrics.`coef.X1.estimate` < 0",
+    )
+    assert len(hits) == 1
+
+
+def test_regress_log_coefficients_sanitizes_awkward_names(tmp_path):
+    mlflow.set_tracking_uri(f"sqlite:///{tmp_path}/mlflow.db")
+    data = pf.get_data()
+
+    fit = regress(
+        "Y ~ X1 + C(f1)",
+        data=data,
+        experiment_name="coef-sanitize",
+        log_coefficients="C(f1)[T.1.0]",
+    )
+
+    run = mlflow.last_active_run()
+    # parens/brackets are illegal in MLflow metric keys and get replaced by _
+    key = "coef.C_f1__T.1.0_.estimate"
+    assert key in run.data.metrics
+    assert run.data.metrics[key] == float(fit.tidy().loc["C(f1)[T.1.0]", "Estimate"])
+
+
+def test_regress_log_coefficients_warns_on_unknown_name(tmp_path):
+    mlflow.set_tracking_uri(f"sqlite:///{tmp_path}/mlflow.db")
+    data = pf.get_data()
+
+    with pytest.warns(UserWarning, match="not a coefficient"):
+        fit = regress(
+            "Y ~ X1 + X2",
+            data=data,
+            experiment_name="coef-unknown",
+            log_coefficients=["X1", "not_a_regressor"],
+        )
+
+    run = mlflow.last_active_run()
+    # the known one is still logged; the run completes normally
+    assert "coef.X1.estimate" in run.data.metrics
+    assert fit._r2 is not None
