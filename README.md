@@ -44,7 +44,9 @@ Each run logs the key parameters (`model_fn`, `fml`, `data_shape`, `vcov`),
 metrics appropriate to the model type (e.g. R² and F-statistic for OLS, pseudo
 R² and deviance for Poisson), the fitted coefficient table (`coefficients.json`),
 and a human-readable regression table (`summary.html`) rendered with pyfixest's
-`etable`.
+`etable`. Pass `log_coefficients=["X1", ...]` to additionally log selected
+coefficients as searchable metrics (`coef.X1.estimate` / `.std_error` /
+`.pvalue`) — opt-in, since models can have hundreds of dummy coefficients.
 
 ## Copying a template
 
