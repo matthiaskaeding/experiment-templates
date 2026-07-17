@@ -126,14 +126,21 @@ def _log_coefficient_metrics(fit: Any, coefficients: str | list[str]) -> None:
 
 
 def _already_logged(experiment_hash: str) -> bool:
-    """Whether a run with this experiment_hash exists in the active experiment.
+    """Whether a FINISHED run with this experiment_hash exists in the active
+    experiment.
 
     ``mlflow.search_runs`` with no experiment argument searches only the currently
     active experiment, so deduplication is scoped to that experiment: the same
     inputs logged under a different experiment are not considered duplicates.
+    Only FINISHED runs count -- a FAILED attempt also logs the hash (so the error
+    is recoverable), and it must not suppress logging of a successful retry with
+    identical inputs.
     """
     runs = mlflow.search_runs(
-        filter_string=f"params.experiment_hash = '{experiment_hash}'",
+        filter_string=(
+            f"params.experiment_hash = '{experiment_hash}' "
+            "and attributes.status = 'FINISHED'"
+        ),
         max_results=1,
     )
     return not runs.empty
@@ -164,6 +171,12 @@ def regress(
     results are supported: formulas that produce several models (e.g. via
     ``sw()``/``csw()`` or multiple dependent variables) raise a ``ValueError``
     before any run is opened; the returned object is also checked as a backstop.
+
+    Estimation errors, by contrast, *are* recorded: the fit runs inside the MLflow
+    run, after the parameters are logged. If ``model_fn`` raises, the run remains
+    in the store (status FAILED) with the formula/hash/params and an ``error`` tag
+    holding the exception, so the failed attempt can be recovered later; the
+    exception is then re-raised.
 
     Which metrics get logged depends on the model type (e.g. ``fepois`` has no R2):
     ``_extract_metrics`` picks the relevant (metric_name, attribute) pairs based on
@@ -231,14 +244,11 @@ def regress(
         model_params["model_fn"] = getattr(model_fn, "__name__", str(model_fn))
         experiment_hash = compute_experiment_hash(data, model_params, global_version)
 
-    fit = model_fn(*args, **kwargs)
-
-    if isinstance(fit, FixestMulti):
-        raise ValueError(_MULTI_MODEL_ERROR)
-
-    # Skip logging (no new run) if an identical experiment was already logged in
-    # the active experiment; the freshly fitted model is still returned.
+    # Dedup hit: skip all logging (no new run), but still fit and return the model.
     if experiment_hash is not None and _already_logged(experiment_hash):
+        fit = model_fn(*args, **kwargs)
+        if isinstance(fit, FixestMulti):
+            raise ValueError(_MULTI_MODEL_ERROR)
         return fit
 
     with mlflow.start_run(run_name=name, tags=tags) as run:
@@ -261,6 +271,19 @@ def regress(
             mlflow.log_param("data_shape", str(data.shape))
         if vcov is not None:
             mlflow.log_param("vcov", str(vcov))
+
+        # Fit inside the run, after the params are logged: if estimation fails,
+        # the run still records what was attempted (formula, hash, data shape,
+        # vcov), gets an `error` tag with the exception, is marked FAILED by the
+        # context manager, and the exception propagates to the caller.
+        try:
+            fit = model_fn(*args, **kwargs)
+        except Exception as exc:
+            mlflow.set_tag("error", f"{type(exc).__name__}: {exc}"[:500])
+            raise
+
+        if isinstance(fit, FixestMulti):
+            raise ValueError(_MULTI_MODEL_ERROR)
 
         mlflow.log_metrics(_extract_metrics(fit))
 

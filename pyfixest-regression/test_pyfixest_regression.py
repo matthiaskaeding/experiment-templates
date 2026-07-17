@@ -3,6 +3,7 @@ import warnings
 import mlflow
 import pyfixest as pf
 import pytest
+from mlflow.entities import ViewType
 
 from hashing import compute_experiment_hash
 from tracking import (
@@ -585,4 +586,55 @@ def test_regress_log_coefficients_warns_on_unknown_name(tmp_path):
     run = mlflow.last_active_run()
     # the known one is still logged; the run completes normally
     assert "coef.X1.estimate" in run.data.metrics
+    assert fit._r2 is not None
+
+
+# --- error capture (#27 / #24) ---
+
+
+def test_regress_logs_params_and_error_tag_when_fit_fails(tmp_path):
+    mlflow.set_tracking_uri(f"sqlite:///{tmp_path}/mlflow.db")
+    data = pf.get_data()
+
+    # Single-model formula (passes the pre-run validation) referencing a column
+    # that does not exist, so the estimation itself raises.
+    with pytest.raises(Exception, match="does_not_exist"):
+        regress("Y ~ does_not_exist", data=data, experiment_name="fit-error")
+
+    runs = mlflow.search_runs(
+        experiment_names=["fit-error"], run_view_type=ViewType.ALL
+    )
+    assert len(runs) == 1
+    row = runs.iloc[0]
+    # the failed attempt is recoverable: params were logged before the fit ...
+    assert row["status"] == "FAILED"
+    assert row["params.fml"] == "Y ~ does_not_exist"
+    assert row["params.experiment_hash"]
+    # ... and the error tag holds the exception
+    assert "does_not_exist" in row["tags.error"]
+
+
+def test_regress_failed_run_is_not_a_dedup_hit(tmp_path):
+    # A FAILED attempt logs the experiment hash too, so a retry with *identical*
+    # inputs (same hash) must not be treated as a duplicate -- otherwise a
+    # transient failure would permanently suppress logging of the successful run.
+    mlflow.set_tracking_uri(f"sqlite:///{tmp_path}/mlflow.db")
+    data = pf.get_data()
+    calls = {"n": 0}
+
+    def flaky_feols(fml, data):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("transient failure")
+        return pf.feols(fml, data)
+
+    with pytest.raises(RuntimeError, match="transient failure"):
+        regress("Y ~ X1 + X2", data=data, model_fn=flaky_feols, experiment_name="flaky")
+
+    fit = regress(
+        "Y ~ X1 + X2", data=data, model_fn=flaky_feols, experiment_name="flaky"
+    )
+
+    runs = mlflow.search_runs(experiment_names=["flaky"], run_view_type=ViewType.ALL)
+    assert set(runs["status"]) == {"FAILED", "FINISHED"}
     assert fit._r2 is not None
