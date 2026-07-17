@@ -5,7 +5,12 @@ import pyfixest as pf
 import pytest
 
 from hashing import compute_experiment_hash
-from tracking import _extract_metrics, regress, results_table
+from tracking import (
+    _extract_metrics,
+    coefficients_table,
+    regress,
+    results_table,
+)
 
 
 def test_regress_logs_single_model(tmp_path):
@@ -420,3 +425,49 @@ def test_results_table_empty_experiment_returns_empty(tmp_path):
     table = results_table("no-runs")
 
     assert table.empty
+
+
+# --- coefficients_table ---
+
+
+def test_coefficients_table_is_long_and_self_describing(tmp_path):
+    mlflow.set_tracking_uri(f"sqlite:///{tmp_path}/mlflow.db")
+    data = pf.get_data()
+
+    regress("Y ~ X1 + X2", data=data, vcov="iid", name="ct")
+    regress("Y ~ X1 + X2", data=data, vcov="hetero", name="ct")
+
+    table = coefficients_table("ct")
+
+    # 2 runs x 3 coefficients (Intercept, X1, X2)
+    assert len(table) == 6
+    assert set(table["Coefficient"]) == {"Intercept", "X1", "X2"}
+    # coefficient stats present
+    for col in ("Estimate", "Std. Error", "run_id"):
+        assert col in table.columns
+    # joined run params make each row self-describing
+    assert "fml" in table.columns and "vcov" in table.columns
+    assert set(table["vcov"]) == {"iid", "hetero"}
+
+
+def test_coefficients_table_filters_by_coefficient(tmp_path):
+    mlflow.set_tracking_uri(f"sqlite:///{tmp_path}/mlflow.db")
+    data = pf.get_data()
+
+    regress("Y ~ X1 + X2", data=data, vcov="iid", name="ct-filter")
+    regress("Y ~ X1 + X2", data=data, vcov="hetero", name="ct-filter")
+
+    only_x1 = coefficients_table("ct-filter", coefficients="X1")
+    assert set(only_x1["Coefficient"]) == {"X1"}
+    assert len(only_x1) == 2  # one X1 row per run
+
+    x1_x2 = coefficients_table("ct-filter", coefficients=["X1", "X2"])
+    assert set(x1_x2["Coefficient"]) == {"X1", "X2"}
+    assert len(x1_x2) == 4
+
+
+def test_coefficients_table_empty_experiment_returns_empty(tmp_path):
+    mlflow.set_tracking_uri(f"sqlite:///{tmp_path}/mlflow.db")
+    mlflow.create_experiment("ct-empty")
+
+    assert coefficients_table("ct-empty").empty

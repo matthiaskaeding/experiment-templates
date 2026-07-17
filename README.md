@@ -29,6 +29,11 @@ experiment. `model_fn` accepts a pyfixest function or its name as a string, e.g.
 DataFrame (one row per run, params and metrics with prefixes stripped); with no
 argument it reads the active experiment.
 
+`coefficients_table(experiment_name=None, coefficients=None)` reads each run's
+`coefficients.json` into one long coefficient-level frame (one row per run ×
+coefficient, with the run's params joined on), optionally filtered to specific
+coefficient names.
+
 ## What gets logged
 
 Each run logs the key parameters (`model_fn`, `fml`, `data_shape`, `vcov`),
