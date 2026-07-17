@@ -50,12 +50,21 @@ coefficients as searchable metrics (`coef.X1.estimate` / `.std_error` /
 
 ## Copying a template
 
+From a clone:
+
 ```
 cp -r pyfixest-regression/ path/to/your/project/
 ```
 
-Then install `mlflow` and `pyfixest` in that project. The tests come along with
-the folder and run with plain `pytest`.
+Or without cloning at all, straight from GitHub into the current directory:
+
+```
+curl -sSL https://github.com/matthiaskaeding/experiment-templates/archive/refs/heads/main.tar.gz \
+  | tar -xz --strip-components=1 experiment-templates-main/pyfixest-regression
+```
+
+Either way, then install `mlflow` and `pyfixest` in that project. The tests come
+along with the folder and run with plain `pytest`.
 
 ## Development
 
