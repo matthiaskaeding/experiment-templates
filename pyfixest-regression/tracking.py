@@ -23,14 +23,13 @@ _MULTI_MODEL_ERROR = (
 )
 
 # MLflow always auto-creates a "Default" experiment with this reserved id, and
-# silently falls back to it when no experiment is active. regress treats
-# that as a mistake rather than logging there (see the guard below).
+# silently falls back to it when no experiment is active. regress warns when a
+# run lands there (see below) so the fallback never goes unnoticed.
 _DEFAULT_EXPERIMENT_ID = "0"
-_NO_EXPERIMENT_ERROR = (
-    "No MLflow experiment is set; this run would land in the implicit 'Default' "
-    "experiment. Pass name=... to regress, or call "
-    "mlflow.set_experiment(...) beforehand. (The 'Default' experiment is not "
-    "supported as a logging target.)"
+_NO_EXPERIMENT_WARNING = (
+    "No MLflow experiment is set; this run is being logged to the implicit "
+    "'Default' experiment. Pass experiment_name=... (or experiment_id=...) to "
+    "regress, or call mlflow.set_experiment(...) once at the top of your script."
 )
 
 
@@ -113,7 +112,8 @@ def regress(
     *args: Any,
     model_fn: Callable[..., Any] | str = pf.feols,
     name: str | None = None,
-    run_name: str | None = None,
+    experiment_name: str | None = None,
+    experiment_id: str | None = None,
     tags: dict[str, str] | None = None,
     global_version: str = "0",
     **kwargs: Any,
@@ -142,12 +142,17 @@ def regress(
 
     Only key parameters are logged: the formula, the data's shape, and vcov.
 
-    ``name`` is optional: if omitted, the run uses whatever experiment is
-    already active (e.g. set once via ``mlflow.set_experiment(...)`` at the top of a
-    script). If that resolves to MLflow's implicit "Default" experiment -- because
-    nothing was set -- a ``ValueError`` is raised instead of logging there, and no
-    run is left behind. The "Default" experiment is not supported as a target even
-    if selected deliberately; use a named experiment.
+    ``name`` is an optional human-readable descriptor of the regression, used as
+    the MLflow *run name*. It does not select or override the experiment, and it is
+    fine to omit: the run is already identified by its content (formula + data +
+    settings, via the experiment hash below).
+
+    Experiment selection: pass ``experiment_name`` or ``experiment_id`` (mutually
+    exclusive) to have MLflow use that experiment. If neither is given, the run
+    uses whatever experiment is already active (e.g. set once via
+    ``mlflow.set_experiment(...)`` at the top of a script). If nothing was set at
+    all -- the run would land in MLflow's implicit "Default" experiment -- a
+    ``UserWarning`` is issued and logging proceeds there.
 
     Deduplication: when ``data`` is a DataFrame, a content hash of (data, model
     params including ``model_fn``, ``global_version``) is computed via
@@ -169,8 +174,12 @@ def regress(
     if fml is not None and len(Formula.parse(fml)) > 1:
         raise ValueError(_MULTI_MODEL_ERROR)
 
-    if name is not None:
-        mlflow.set_experiment(name)
+    if experiment_name is not None and experiment_id is not None:
+        raise ValueError("Pass either experiment_name or experiment_id, not both.")
+    if experiment_name is not None or experiment_id is not None:
+        mlflow.set_experiment(
+            experiment_name=experiment_name, experiment_id=experiment_id
+        )
 
     experiment_hash = None
     if isinstance(data, pd.DataFrame):
@@ -188,16 +197,16 @@ def regress(
     if experiment_hash is not None and _already_logged(experiment_hash):
         return fit
 
-    with mlflow.start_run(run_name=run_name, tags=tags) as run:
-        # If no name was given and nothing was set beforehand, the run
-        # lands in MLflow's implicit "Default" experiment. Reject that -- but the
-        # run is already open, so end and delete it first, otherwise the guard
-        # would itself leave a FAILED run in Default (the pollution it prevents).
-        if name is None and run.info.experiment_id == _DEFAULT_EXPERIMENT_ID:
-            run_id = run.info.run_id
-            mlflow.end_run()
-            mlflow.delete_run(run_id)
-            raise ValueError(_NO_EXPERIMENT_ERROR)
+    with mlflow.start_run(run_name=name, tags=tags) as run:
+        # If no experiment was selected and none was set beforehand, the run lands
+        # in MLflow's implicit "Default" experiment. That is allowed but almost
+        # never intended, so surface it instead of letting it pass silently.
+        if (
+            experiment_name is None
+            and experiment_id is None
+            and run.info.experiment_id == _DEFAULT_EXPERIMENT_ID
+        ):
+            warnings.warn(_NO_EXPERIMENT_WARNING, stacklevel=2)
 
         mlflow.log_param("model_fn", getattr(model_fn, "__name__", str(model_fn)))
         if experiment_hash is not None:

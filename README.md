@@ -19,11 +19,15 @@ fit = regress("Y ~ X1 + X2", data=df, vcov="hetero")
 runs = results_table("my-analysis")    # one tidy row per logged run
 ```
 
-`name` is an optional per-call experiment override. The normal pattern is to
-call `mlflow.set_experiment(...)` once at the top of the script (or set the
-`MLFLOW_EXPERIMENT_NAME` environment variable) and let runs land in the active
-experiment. `model_fn` accepts a pyfixest function or its name as a string, e.g.
-`model_fn="fepois"`; it defaults to `feols`.
+The normal pattern is to call `mlflow.set_experiment(...)` once at the top of
+the script (or set the `MLFLOW_EXPERIMENT_NAME` environment variable) and let
+runs land in the active experiment; alternatively pass `experiment_name=` or
+`experiment_id=` per call. If no experiment is set at all, a warning is issued
+and the run lands in MLflow's "Default" experiment. `name` is an optional
+descriptor of the regression, used as the MLflow run name — runs are identified
+by their content (formula + data + settings) either way. `model_fn` accepts a
+pyfixest function or its name as a string, e.g. `model_fn="fepois"`; it defaults
+to `feols`.
 
 `results_table(experiment_name=None)` pulls the logged runs back as a tidy
 DataFrame (one row per run, params and metrics with prefixes stripped); with no
