@@ -237,3 +237,31 @@ def _resolve_model_fn(model_fn: Callable[..., Any] | str) -> Callable[..., Any]:
     if not callable(resolved):
         raise ValueError(f"Unknown pyfixest model function: {model_fn!r}")
     return resolved
+
+
+def results_table(experiment_name: str | None = None) -> pd.DataFrame:
+    """Return a tidy one-row-per-run comparison table of logged runs.
+
+    A thin, readable wrapper over ``mlflow.search_runs`` so you don't hand-write
+    the query and column selection each time you want to compare runs. Keeps
+    ``run_id`` plus the logged params and metrics (with their ``params.``/
+    ``metrics.`` prefixes stripped, params before metrics), and drops MLflow
+    bookkeeping columns (status, timings, artifact_uri, tags).
+
+    With no argument it reads the active experiment (set via
+    ``mlflow.set_experiment(...)``); pass ``experiment_name`` to read a specific
+    one. Returns an empty DataFrame if the experiment has no runs.
+    """
+    if experiment_name is None:
+        runs = mlflow.search_runs()
+    else:
+        runs = mlflow.search_runs(experiment_names=[experiment_name])
+
+    if runs.empty:
+        return runs
+
+    params = [c for c in runs.columns if c.startswith("params.")]
+    metrics = [c for c in runs.columns if c.startswith("metrics.")]
+    columns = ["run_id", *params, *metrics]
+    renamed = {c: c.split(".", 1)[1] for c in params + metrics}
+    return runs[columns].rename(columns=renamed)
