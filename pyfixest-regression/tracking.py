@@ -265,3 +265,50 @@ def results_table(experiment_name: str | None = None) -> pd.DataFrame:
     columns = ["run_id", *params, *metrics]
     renamed = {c: c.split(".", 1)[1] for c in params + metrics}
     return runs[columns].rename(columns=renamed)
+
+
+def coefficients_table(
+    experiment_name: str | None = None,
+    coefficients: str | list[str] | None = None,
+) -> pd.DataFrame:
+    """Return a coefficient-level table across an experiment's runs.
+
+    Reads each run's logged ``coefficients.json`` artifact (via
+    ``mlflow.load_table``) and stacks them into one long DataFrame -- one row per
+    (run, coefficient), with the coefficient estimate/std-error/etc. columns -- and
+    left-joins the run's logged params (``fml``, ``vcov``, ``model_fn``, ...) so
+    each row is self-describing. ``run_id`` identifies the run.
+
+    With no argument it reads the active experiment; pass ``experiment_name`` to
+    read a specific one. Pass ``coefficients`` (a name or list of names) to keep
+    only those coefficients. Returns an empty DataFrame if the experiment has no
+    runs.
+
+    Note: coefficients are read back from the per-run artifact, not from
+    searchable params/metrics -- so you cannot yet push coefficient filtering into
+    the MLflow query (see the coefficient-level-logging issue).
+    """
+    if experiment_name is None:
+        runs = mlflow.search_runs()
+    else:
+        runs = mlflow.search_runs(experiment_names=[experiment_name])
+
+    if runs.empty:
+        return runs
+
+    run_ids = runs["run_id"].tolist()
+    table = mlflow.load_table(
+        "coefficients.json", run_ids=run_ids, extra_columns=["run_id"]
+    )
+
+    param_cols = [c for c in runs.columns if c.startswith("params.")]
+    params = runs[["run_id", *param_cols]].rename(
+        columns={c: c.split(".", 1)[1] for c in param_cols}
+    )
+    table = table.merge(params, on="run_id", how="left")
+
+    if coefficients is not None:
+        names = [coefficients] if isinstance(coefficients, str) else list(coefficients)
+        table = table[table["Coefficient"].isin(names)].reset_index(drop=True)
+
+    return table
