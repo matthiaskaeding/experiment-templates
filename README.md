@@ -1,16 +1,21 @@
 # experiment-templates
 
-Copy-paste templates for statistical experiments tracked with MLflow. Each
-top-level folder is one self-contained template — code plus its tests — named
-`library-task`, for example `pyfixest-regression/`. This is not a Python
-package; the intended use is copying a folder into your own project and working
-from there.
+Copy-paste templates for statistical experiments tracked with MLflow, as a flat
+collection of modules at the repository root. The pyfixest regression template
+is a single self-contained module, `pyfixest_regression.py` (with
+`test_pyfixest_regression.py` and `example.ipynb` alongside). This is not a
+Python package; the intended use is
+copying the module file into your own project and working from there — one file,
+no intra-template imports to rewrite wherever it lands. The flat layout also
+keeps the door open for shared building blocks across templates — for example a
+registry that different templates use to register reusable feature
+transformations — instead of isolating everything per folder.
 
 ## Usage
 
 ```python
 import mlflow
-from tracking import regress, results_table
+from pyfixest_regression import regress, results_table
 
 mlflow.set_experiment("my-analysis")   # once per script
 
@@ -57,18 +62,18 @@ coefficients as searchable metrics (`coef.X1.estimate` / `.std_error` /
 From a clone:
 
 ```
-cp -r pyfixest-regression/ path/to/your/project/
+cp pyfixest_regression.py path/to/your/project/
 ```
 
 Or without cloning at all, straight from GitHub into the current directory:
 
 ```
-curl -sSL https://github.com/matthiaskaeding/experiment-templates/archive/refs/heads/main.tar.gz \
-  | tar -xz --strip-components=1 experiment-templates-main/pyfixest-regression
+curl -sSLO https://raw.githubusercontent.com/matthiaskaeding/experiment-templates/main/pyfixest_regression.py
 ```
 
-Either way, then install `mlflow` and `pyfixest` in that project. The tests come
-along with the folder and run with plain `pytest`.
+Either way, then install `mlflow` and `pyfixest` in that project. Grab
+`test_pyfixest_regression.py` too if you want the tests; they run with plain
+`pytest`.
 
 ## Development
 

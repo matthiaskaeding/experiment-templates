@@ -19,8 +19,7 @@ dev = [
 ]
 
 [tool.pytest.ini_options]
-# Each template folder is self-contained (code + tests); append new ones here.
-testpaths = ["pyfixest-regression"]
+testpaths = ["."]
 
 [tool.ruff.lint.per-file-ignores]
 # Notebooks legitimately interleave setup statements with imports (e.g. warning
