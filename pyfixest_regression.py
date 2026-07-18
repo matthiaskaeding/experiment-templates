@@ -95,14 +95,39 @@ def _bind_args(
     return bound.arguments
 
 
+def _validate_key_coefs(key_coefs: str | list[str], fml: str) -> None:
+    """Raise if any name in ``key_coefs`` is not a variable of the formula.
+
+    Reuses the formula-variable extraction from the hashing code
+    (``_formula_variables``) so the check understands transforms, interactions,
+    fixed effects, and IV parts. A typo'd or absent coefficient name should fail
+    loudly here -- before any run is opened -- rather than silently logging
+    nothing. If the formula can't be parsed for variables the check is skipped
+    (the estimator will raise its own error at fit time).
+    """
+    variables = _formula_variables(fml)
+    if variables is None:
+        return
+    requested = [key_coefs] if isinstance(key_coefs, str) else list(key_coefs)
+    missing = [name for name in requested if name not in variables]
+    if missing:
+        raise ValueError(
+            f"key_coefs {missing} are not variables in the formula {fml!r}; "
+            f"available variables are {sorted(variables)}."
+        )
+
+
 def _select_key_coefs(
     fit: Any, key_coefs: str | list[str] | None, n_key_coefs: int
 ) -> list[str]:
     """The coefficient names to log as metrics.
 
-    When ``key_coefs`` is given (a name or list), those are used -- names not in
-    the fitted model are dropped with a warning. Otherwise it falls back to the
-    first ``n_key_coefs`` coefficients in model order. The fallback is capped at
+    When ``key_coefs`` is given (a name or list), those are used (their membership
+    in the formula is validated up front by ``regress``, so a typo raises rather
+    than silently logging nothing); only names that resolve to an actual model
+    coefficient are kept, which drops formula variables that don't map to a single
+    coefficient (e.g. a factor's base name). Otherwise it falls back to the first
+    ``n_key_coefs`` coefficients in model order. The fallback is capped at
     ``n_key_coefs`` on purpose: selecting by position is a convenience, and a
     dummy- or fixed-effect-heavy spec can have hundreds of coefficients that
     should not all become metrics. Position is not reliable for picking the
@@ -112,17 +137,7 @@ def _select_key_coefs(
     index = list(fit.tidy().index)
     if key_coefs is not None:
         requested = [key_coefs] if isinstance(key_coefs, str) else list(key_coefs)
-        selected = []
-        for name in requested:
-            if name in index:
-                selected.append(name)
-            else:
-                warnings.warn(
-                    f"key_coefs: {name!r} is not a coefficient of the fitted "
-                    f"model; skipping.",
-                    stacklevel=3,
-                )
-        return selected
+        return [name for name in requested if name in index]
     return index[: max(n_key_coefs, 0)]
 
 
@@ -234,12 +249,15 @@ def regress(
     ``key_coefs`` (a coefficient name or list) picks which -- use it for the
     coefficient you actually care about, e.g. a treatment effect, since selecting
     by position is unreliable (the intercept comes first, ``C()``/``i()``
-    expansions reorder). When ``key_coefs`` is not given it falls back to the first
-    ``n_key_coefs`` coefficients (default 5); the cap matters because dummy- or
-    fixed-effect-heavy specs can have hundreds of coefficients. Pass
-    ``n_key_coefs=0`` (with no ``key_coefs``) to log none. Only numbers are logged
-    -- stars and CIs are rendered from them elsewhere -- and the complete
-    coefficient table always remains in the ``coefficients.json`` artifact.
+    expansions reorder). Names in ``key_coefs`` must be variables of the formula;
+    a name that isn't raises a ``ValueError`` before any run is opened (a typo'd
+    coefficient should fail loudly, not silently log nothing). When ``key_coefs``
+    is not given it falls back to the first ``n_key_coefs`` coefficients (default
+    5); the cap matters because dummy- or fixed-effect-heavy specs can have
+    hundreds of coefficients. Pass ``n_key_coefs=0`` (with no ``key_coefs``) to log
+    none. Only numbers are logged -- stars and CIs are rendered from them elsewhere
+    -- and the complete coefficient table always remains in the
+    ``coefficients.json`` artifact.
 
     Deduplication: when ``data`` is a DataFrame, a content hash of (data, model
     params including ``model_fn``, ``global_version``) is computed via
@@ -266,6 +284,9 @@ def regress(
 
     if fml is not None and len(Formula.parse(fml)) > 1:
         raise ValueError(_MULTI_MODEL_ERROR)
+
+    if key_coefs is not None and fml is not None:
+        _validate_key_coefs(key_coefs, fml)
 
     if experiment_name is not None and experiment_id is not None:
         raise ValueError("Pass either experiment_name or experiment_id, not both.")
@@ -398,6 +419,8 @@ def _summary_markdown(fit: Any, metrics: dict[str, float]) -> str:
 def etable(
     experiment_name: str | None = None,
     coefficients: str | list[str] | None = None,
+    drop: str | list[str] | None = None,
+    filter_string: str | None = None,
     type: str = "df",
 ) -> pd.DataFrame | str:
     """Build a cross-run regression table from the logged runs.
@@ -409,18 +432,26 @@ def etable(
     metrics). Unlike ``pf.etable`` this works after the fact, across runs, for
     every model type. Fixed effects show up in the ``fml`` row (e.g. ``| f1``).
 
-    ``coefficients`` (a name or list) keeps only those coefficient rows.
-    ``type="df"`` (default) returns a DataFrame; ``type="md"`` returns a
-    markdown string (with formula pipes escaped). Returns an empty
-    DataFrame/string if the experiment has no runs.
+    ``coefficients`` (a name or list) keeps only those coefficient rows; ``drop``
+    (a name or list) removes them (keep first, then drop) -- handy for hiding the
+    intercept or a block of controls to focus on the coefficient of interest.
+    ``filter_string`` is forwarded to ``mlflow.search_runs`` to restrict which runs
+    become columns (e.g. ``"tags.`mlflow.runName` = 'baseline'"``). ``type="df"``
+    (default) returns a DataFrame; ``type="md"`` returns a markdown string (with
+    formula pipes escaped). Returns an empty DataFrame/string if nothing matches.
     """
     if type not in ("df", "md"):
         raise ValueError(f"type must be 'df' or 'md', got {type!r}")
 
-    runs = results_table(experiment_name)
+    runs = results_table(experiment_name, filter_string=filter_string)
     if runs.empty:
         return runs if type == "df" else ""
-    coefs = coefficients_table(experiment_name, coefficients)
+    coefs = coeftable(
+        experiment_name,
+        coefficients=coefficients,
+        drop=drop,
+        filter_string=filter_string,
+    )
 
     stat_rows = ("fml", "vcov", "nobs", "r2", "adj_r2", "pseudo_r2", "deviance")
     columns: dict[str, dict[str, str]] = {}
@@ -457,7 +488,29 @@ def etable(
     return table
 
 
-def results_table(experiment_name: str | None = None) -> pd.DataFrame:
+def _search_runs(
+    experiment_name: str | None, filter_string: str | None
+) -> pd.DataFrame:
+    """``mlflow.search_runs`` scoped to an experiment and an optional filter.
+
+    With ``experiment_name=None`` it searches the active experiment. The
+    ``filter_string`` is passed straight through to MLflow, so it accepts the full
+    query syntax over params, metrics, tags, and attributes -- e.g.
+    ``"tags.`mlflow.runName` = 'baseline'"`` to filter by a run's ``name``, or
+    ``"metrics.r2 > 0.9"``.
+    """
+    kwargs: dict[str, Any] = {}
+    if experiment_name is not None:
+        kwargs["experiment_names"] = [experiment_name]
+    if filter_string is not None:
+        kwargs["filter_string"] = filter_string
+    return mlflow.search_runs(**kwargs)
+
+
+def results_table(
+    experiment_name: str | None = None,
+    filter_string: str | None = None,
+) -> pd.DataFrame:
     """Return a tidy one-row-per-run comparison table of logged runs.
 
     A thin, readable wrapper over ``mlflow.search_runs`` so you don't hand-write
@@ -468,12 +521,12 @@ def results_table(experiment_name: str | None = None) -> pd.DataFrame:
 
     With no argument it reads the active experiment (set via
     ``mlflow.set_experiment(...)``); pass ``experiment_name`` to read a specific
-    one. Returns an empty DataFrame if the experiment has no runs.
+    one. ``filter_string`` is forwarded to ``mlflow.search_runs`` for arbitrary
+    server-side filtering -- e.g. by a run's ``name``
+    (``"tags.`mlflow.runName` = 'baseline'"``), a metric (``"metrics.r2 > 0.9"``),
+    or a param. Returns an empty DataFrame if nothing matches.
     """
-    if experiment_name is None:
-        runs = mlflow.search_runs()
-    else:
-        runs = mlflow.search_runs(experiment_names=[experiment_name])
+    runs = _search_runs(experiment_name, filter_string)
 
     if runs.empty:
         return runs
@@ -485,9 +538,11 @@ def results_table(experiment_name: str | None = None) -> pd.DataFrame:
     return runs[columns].rename(columns=renamed)
 
 
-def coefficients_table(
+def coeftable(
     experiment_name: str | None = None,
     coefficients: str | list[str] | None = None,
+    drop: str | list[str] | None = None,
+    filter_string: str | None = None,
 ) -> pd.DataFrame:
     """Return a coefficient-level table across an experiment's runs.
 
@@ -498,18 +553,14 @@ def coefficients_table(
     each row is self-describing. ``run_id`` identifies the run.
 
     With no argument it reads the active experiment; pass ``experiment_name`` to
-    read a specific one. Pass ``coefficients`` (a name or list of names) to keep
-    only those coefficients. Returns an empty DataFrame if the experiment has no
-    runs.
-
-    Note: coefficients are read back from the per-run artifact, not from
-    searchable params/metrics -- so you cannot yet push coefficient filtering into
-    the MLflow query (see the coefficient-level-logging issue).
+    read a specific one. ``coefficients`` (a name or list) keeps only those
+    coefficient rows; ``drop`` (a name or list) removes them -- with both, the keep
+    is applied first, then the drop. ``filter_string`` is forwarded to
+    ``mlflow.search_runs`` to restrict which runs are included (e.g.
+    ``"tags.`mlflow.runName` = 'baseline'"``). Returns an empty DataFrame if
+    nothing matches.
     """
-    if experiment_name is None:
-        runs = mlflow.search_runs()
-    else:
-        runs = mlflow.search_runs(experiment_names=[experiment_name])
+    runs = _search_runs(experiment_name, filter_string)
 
     if runs.empty:
         return runs
@@ -527,9 +578,12 @@ def coefficients_table(
 
     if coefficients is not None:
         names = [coefficients] if isinstance(coefficients, str) else list(coefficients)
-        table = table[table["Coefficient"].isin(names)].reset_index(drop=True)
+        table = table[table["Coefficient"].isin(names)]
+    if drop is not None:
+        names = [drop] if isinstance(drop, str) else list(drop)
+        table = table[~table["Coefficient"].isin(names)]
 
-    return table
+    return table.reset_index(drop=True)
 
 
 # --- Content-based hashing ---------------------------------------------------
@@ -608,23 +662,22 @@ def _used_columns(data: pd.DataFrame, model_params: dict[str, Any]) -> list[str]
     try:
         from formulaic import Formula as _FormulaicFormula
 
+        fml = model_params.get("fml")
+        if fml is not None:
+            names = _formula_variables(fml)
+            # ``_formula_variables`` returns None for a multi-model spec (sw()/csw()
+            # or several LHS variables) or a parse failure -- no single column set,
+            # so bail to the full-frame hash.
+            if names is None:
+                return None
+            names = set(names)
+        else:
+            names = set()
+
         def _vars(expr: str | None) -> set[str]:
             if not expr:
                 return set()
             return set(_FormulaicFormula(expr).required_variables)
-
-        names: set[str] = set()
-
-        fml = model_params.get("fml")
-        if fml is not None:
-            parsed = Formula.parse(fml)
-            # A multi-model spec (e.g. sw()/csw() or several LHS variables) does
-            # not have one well-defined column set; bail to the full-frame hash.
-            if len(parsed) != 1:
-                return None
-            model = parsed[0]
-            for part in (model.second_stage, model.first_stage, model.fixed_effects):
-                names |= _vars(part)
 
         vcov = model_params.get("vcov")
         if isinstance(vcov, dict):
@@ -643,6 +696,33 @@ def _used_columns(data: pd.DataFrame, model_params: dict[str, Any]) -> list[str]
         if not used:
             return None
         return sorted(used)  # sorted -> hash is invariant to frame column order
+    except Exception:
+        return None
+
+
+def _formula_variables(fml: str) -> set[str] | None:
+    """The variables a single-model formula references, or None if undetermined.
+
+    Uses the same parser pyfixest does -- ``Formula.parse`` to split the spec into
+    its parts (second stage, IV first stage, fixed effects), then ``formulaic`` to
+    list each part's variables -- so transforms, interactions, fixed effects (after
+    ``|``) and IV instruments are all covered, unlike a regex over the string. The
+    result includes the response and can include non-column tokens (e.g. the ``i``
+    of pyfixest's ``i(...)``); callers that need real columns should intersect with
+    the frame. Returns None for a multi-model spec or any parse failure.
+    """
+    try:
+        from formulaic import Formula as _FormulaicFormula
+
+        parsed = Formula.parse(fml)
+        if len(parsed) != 1:
+            return None
+        model = parsed[0]
+        names: set[str] = set()
+        for part in (model.second_stage, model.first_stage, model.fixed_effects):
+            if part:
+                names |= set(_FormulaicFormula(part).required_variables)
+        return names
     except Exception:
         return None
 

@@ -7,7 +7,7 @@ from mlflow.entities import ViewType
 
 from pyfixest_regression import (
     _extract_metrics,
-    coefficients_table,
+    coeftable,
     compute_experiment_hash,
     etable,
     regress,
@@ -600,17 +600,39 @@ def test_results_table_empty_experiment_returns_empty(tmp_path):
     assert table.empty
 
 
-# --- coefficients_table ---
+def test_results_table_filter_string_by_name_and_metric(tmp_path):
+    mlflow.set_tracking_uri(f"sqlite:///{tmp_path}/mlflow.db")
+    data = pf.get_data()
+
+    regress(
+        "Y ~ X1 + X2", data=data, vcov="iid", name="baseline", experiment_name="rt-f"
+    )
+    regress(
+        "Y ~ X1 + X2", data=data, vcov="hetero", name="robust", experiment_name="rt-f"
+    )
+
+    # filter by the run name (stored as the mlflow.runName tag)
+    named = results_table("rt-f", filter_string="tags.`mlflow.runName` = 'robust'")
+    assert len(named) == 1
+    assert set(named["vcov"]) == {"hetero"}
+
+    # arbitrary server-side filtering also works, e.g. on a param
+    iid = results_table("rt-f", filter_string="params.vcov = 'iid'")
+    assert len(iid) == 1
+    assert set(iid["vcov"]) == {"iid"}
 
 
-def test_coefficients_table_is_long_and_self_describing(tmp_path):
+# --- coeftable ---
+
+
+def test_coeftable_is_long_and_self_describing(tmp_path):
     mlflow.set_tracking_uri(f"sqlite:///{tmp_path}/mlflow.db")
     data = pf.get_data()
 
     regress("Y ~ X1 + X2", data=data, vcov="iid", experiment_name="ct")
     regress("Y ~ X1 + X2", data=data, vcov="hetero", experiment_name="ct")
 
-    table = coefficients_table("ct")
+    table = coeftable("ct")
 
     # 2 runs x 3 coefficients (Intercept, X1, X2)
     assert len(table) == 6
@@ -623,27 +645,54 @@ def test_coefficients_table_is_long_and_self_describing(tmp_path):
     assert set(table["vcov"]) == {"iid", "hetero"}
 
 
-def test_coefficients_table_filters_by_coefficient(tmp_path):
+def test_coeftable_filters_by_coefficient(tmp_path):
     mlflow.set_tracking_uri(f"sqlite:///{tmp_path}/mlflow.db")
     data = pf.get_data()
 
     regress("Y ~ X1 + X2", data=data, vcov="iid", experiment_name="ct-filter")
     regress("Y ~ X1 + X2", data=data, vcov="hetero", experiment_name="ct-filter")
 
-    only_x1 = coefficients_table("ct-filter", coefficients="X1")
+    only_x1 = coeftable("ct-filter", coefficients="X1")
     assert set(only_x1["Coefficient"]) == {"X1"}
     assert len(only_x1) == 2  # one X1 row per run
 
-    x1_x2 = coefficients_table("ct-filter", coefficients=["X1", "X2"])
+    x1_x2 = coeftable("ct-filter", coefficients=["X1", "X2"])
     assert set(x1_x2["Coefficient"]) == {"X1", "X2"}
     assert len(x1_x2) == 4
 
 
-def test_coefficients_table_empty_experiment_returns_empty(tmp_path):
+def test_coeftable_drops_coefficients(tmp_path):
+    mlflow.set_tracking_uri(f"sqlite:///{tmp_path}/mlflow.db")
+    data = pf.get_data()
+
+    regress("Y ~ X1 + X2", data=data, vcov="iid", experiment_name="ct-drop")
+    regress("Y ~ X1 + X2", data=data, vcov="hetero", experiment_name="ct-drop")
+
+    no_intercept = coeftable("ct-drop", drop="Intercept")
+    assert set(no_intercept["Coefficient"]) == {"X1", "X2"}
+
+    # keep is applied before drop: keep {X1, X2}, then drop X2 -> only X1
+    only_x1 = coeftable("ct-drop", coefficients=["X1", "X2"], drop="X2")
+    assert set(only_x1["Coefficient"]) == {"X1"}
+
+
+def test_coeftable_filter_string_selects_runs(tmp_path):
+    mlflow.set_tracking_uri(f"sqlite:///{tmp_path}/mlflow.db")
+    data = pf.get_data()
+
+    regress("Y ~ X1 + X2", data=data, vcov="iid", experiment_name="ct-fs")
+    regress("Y ~ X1 + X2", data=data, vcov="hetero", experiment_name="ct-fs")
+
+    hetero = coeftable("ct-fs", filter_string="params.vcov = 'hetero'")
+    assert set(hetero["vcov"]) == {"hetero"}
+    assert len(hetero) == 3  # one run x 3 coefficients
+
+
+def test_coeftable_empty_experiment_returns_empty(tmp_path):
     mlflow.set_tracking_uri(f"sqlite:///{tmp_path}/mlflow.db")
     mlflow.create_experiment("ct-empty")
 
-    assert coefficients_table("ct-empty").empty
+    assert coeftable("ct-empty").empty
 
 
 # --- key coefficient logging ---
@@ -722,40 +771,39 @@ def test_regress_key_coefs_selects_named_coefficients(tmp_path):
     assert len(hits) == 1
 
 
-def test_regress_key_coefs_sanitizes_awkward_names(tmp_path):
+def test_key_coef_metrics_sanitize_awkward_names(tmp_path):
     mlflow.set_tracking_uri(f"sqlite:///{tmp_path}/mlflow.db")
     data = pf.get_data()
 
+    # C(f1) expands to coefficients like "C(f1)[T.1.0]"; the parens/brackets are
+    # illegal in MLflow metric keys, so the logged key must be sanitized. These
+    # awkward names arrive via the default first-n path (key_coefs takes formula
+    # variables, not expanded coefficient names).
     fit = regress(
-        "Y ~ X1 + C(f1)",
-        data=data,
-        experiment_name="key-sanitize",
-        key_coefs="C(f1)[T.1.0]",
+        "Y ~ C(f1)", data=data, experiment_name="key-sanitize", n_key_coefs=50
     )
 
     run = mlflow.last_active_run()
-    # parens/brackets are illegal in MLflow metric keys and get replaced by _
     key = "coef.C_f1__T.1.0_"
     assert key in run.data.metrics
     assert run.data.metrics[key] == float(fit.tidy().loc["C(f1)[T.1.0]", "Estimate"])
 
 
-def test_regress_key_coefs_warns_on_unknown_name(tmp_path):
+def test_regress_key_coefs_raises_on_unknown_name(tmp_path):
     mlflow.set_tracking_uri(f"sqlite:///{tmp_path}/mlflow.db")
     data = pf.get_data()
 
-    with pytest.warns(UserWarning, match="not a coefficient"):
-        fit = regress(
+    # a name that isn't a formula variable fails loudly, before any run is opened
+    with pytest.raises(ValueError, match="not_a_regressor"):
+        regress(
             "Y ~ X1 + X2",
             data=data,
             experiment_name="key-unknown",
             key_coefs=["X1", "not_a_regressor"],
         )
 
-    run = mlflow.last_active_run()
-    # the known one is still logged; the run completes normally
-    assert "coef.X1" in run.data.metrics
-    assert fit._r2 is not None
+    # validation happens before the run (and even the experiment) is created
+    assert mlflow.search_runs(search_all_experiments=True).empty
 
 
 # --- error capture (#27 / #24) ---
@@ -861,3 +909,28 @@ def test_etable_filters_coefficients_and_handles_empty(tmp_path):
 
     with pytest.raises(ValueError, match="'df' or 'md'"):
         etable("xrun-filter", type="html")
+
+
+def test_etable_drops_coefficients(tmp_path):
+    mlflow.set_tracking_uri(f"sqlite:///{tmp_path}/mlflow.db")
+    data = pf.get_data()
+
+    regress("Y ~ X1 + X2", data=data, experiment_name="xrun-drop")
+    table = etable("xrun-drop", drop="Intercept")
+
+    assert "Intercept" not in table.index
+    assert "X1" in table.index and "X2" in table.index
+
+
+def test_etable_filter_string_selects_run_columns(tmp_path):
+    mlflow.set_tracking_uri(f"sqlite:///{tmp_path}/mlflow.db")
+    data = pf.get_data()
+
+    regress("Y ~ X1 + X2", data=data, vcov="iid", experiment_name="xrun-fs")
+    regress("Y ~ X1 + X2", data=data, vcov="hetero", experiment_name="xrun-fs")
+
+    # both runs -> two columns; filtering to one run -> a single column
+    assert etable("xrun-fs").shape[1] == 2
+    one = etable("xrun-fs", filter_string="params.vcov = 'hetero'")
+    assert one.shape[1] == 1
+    assert (one.loc["vcov"] == "hetero").all()
