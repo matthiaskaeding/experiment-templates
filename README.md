@@ -2,9 +2,10 @@
 
 Copy-paste templates for statistical experiments tracked with MLflow, as a flat
 collection of modules at the repository root. The pyfixest regression template
-is `tracking.py` + `hashing.py` (with `test_tracking.py` and `example.ipynb`
-alongside). This is not a Python package; the intended use is copying the
-module files into your own project and working from there. The flat layout also
+is a single self-contained module, `tracking.py` (with `test_tracking.py` and
+`example.ipynb` alongside). This is not a Python package; the intended use is
+copying the module file into your own project and working from there — one file,
+no intra-template imports to rewrite wherever it lands. The flat layout also
 keeps the door open for shared building blocks across templates — for example a
 registry that different templates use to register reusable feature
 transformations — instead of isolating everything per folder.
@@ -60,14 +61,13 @@ coefficients as searchable metrics (`coef.X1.estimate` / `.std_error` /
 From a clone:
 
 ```
-cp tracking.py hashing.py path/to/your/project/
+cp tracking.py path/to/your/project/
 ```
 
 Or without cloning at all, straight from GitHub into the current directory:
 
 ```
 curl -sSLO https://raw.githubusercontent.com/matthiaskaeding/experiment-templates/main/tracking.py
-curl -sSLO https://raw.githubusercontent.com/matthiaskaeding/experiment-templates/main/hashing.py
 ```
 
 Either way, then install `mlflow` and `pyfixest` in that project. Grab
