@@ -373,6 +373,11 @@ def regress(
             warnings.warn(_NO_EXPERIMENT_WARNING, stacklevel=2)
 
         mlflow.log_param("model_fn", getattr(model_fn, "__name__", str(model_fn)))
+        # Log the user-given name as a param too (the run_name/tag MLflow always
+        # sets is auto-generated when name is None, so it can't tell a real name
+        # from a random one; the param is present only when the user named the run).
+        if name is not None:
+            mlflow.log_param("name", name)
         if experiment_hash is not None:
             mlflow.log_param("experiment_hash", experiment_hash)
         if fml is not None:
@@ -479,6 +484,32 @@ def _summary_markdown(fit: Any, metrics: dict[str, float]) -> str:
     return "\n".join(lines)
 
 
+def _abbrev_formula(fml: Any) -> str:
+    """A short label for a formula: its right-hand side (predictors)."""
+    if not isinstance(fml, str):
+        return ""
+    return fml.split("~", 1)[1].strip() if "~" in fml else fml.strip()
+
+
+def _column_label(name: Any, fml: Any) -> str:
+    """An etable column header: the run's name if it has one, else the formula
+    abbreviated to its right-hand side."""
+    if isinstance(name, str) and name.strip():
+        return name
+    return _abbrev_formula(fml)
+
+
+def _dedupe_labels(labels: list[str]) -> list[str]:
+    """Make column labels unique by suffixing repeats with ``(2)``, ``(3)`` ...
+    so runs that share a name (or formula) still get distinct columns."""
+    seen: dict[str, int] = {}
+    out = []
+    for label in labels:
+        seen[label] = seen.get(label, 0) + 1
+        out.append(label if seen[label] == 1 else f"{label} ({seen[label]})")
+    return out
+
+
 def etable(
     experiment_name: str | None = None,
     coefficients: str | list[str] | None = None,
@@ -488,12 +519,16 @@ def etable(
 ) -> pd.DataFrame | str:
     """Build a cross-run regression table from the logged runs.
 
-    Reconstructs a side-by-side comparison -- one column per run (oldest first,
-    labeled ``(1)``, ``(2)``, ...), coefficient rows as ``estimate<stars> (se)``,
-    followed by spec/stat rows (``fml``, ``vcov``, ``nobs``, R2-style metrics) --
-    entirely from what ``regress`` logged (``coefficients.json`` + params +
-    metrics). Unlike ``pf.etable`` this works after the fact, across runs, for
-    every model type. Fixed effects show up in the ``fml`` row (e.g. ``| f1``).
+    Reconstructs a side-by-side comparison -- one column per run (oldest first),
+    coefficient rows as ``estimate<stars> (se)``, followed by spec/stat rows
+    (``fml``, ``vcov``, ``nobs``, R2-style metrics) -- entirely from what
+    ``regress`` logged (``coefficients.json`` + params + metrics). Unlike
+    ``pf.etable`` this works after the fact, across runs, for every model type.
+    Fixed effects show up in the ``fml`` row (e.g. ``| f1``).
+
+    Columns are headed by each run's ``name`` when it has one, otherwise by an
+    abbreviated formula (the right-hand side); duplicate headers get a ``(2)``,
+    ``(3)`` ... suffix so the columns stay distinct.
 
     ``coefficients`` (a name or list) keeps only those coefficient rows; ``drop``
     (a name or list) removes them (keep first, then drop) -- handy for hiding the
@@ -517,9 +552,9 @@ def etable(
     )
 
     stat_rows = ("fml", "vcov", "nobs", "r2", "adj_r2", "pseudo_r2", "deviance")
-    columns: dict[str, dict[str, str]] = {}
-    # search_runs returns newest first; present oldest first as (1), (2), ...
-    for i, (_, run) in enumerate(runs.iloc[::-1].iterrows(), start=1):
+    # search_runs returns newest first; present oldest first (left to right).
+    built: list[tuple[str, dict[str, str]]] = []
+    for _, run in runs.iloc[::-1].iterrows():
         column: dict[str, str] = {}
         run_coefs = coefs[coefs["run_id"] == run["run_id"]]
         for _, c in run_coefs.iterrows():
@@ -535,7 +570,12 @@ def etable(
                 column[stat] = f"{value:.3f}"
             else:
                 column[stat] = str(value)
-        columns[f"({i})"] = column
+        built.append((_column_label(run.get("name"), run.get("fml")), column))
+
+    labels = _dedupe_labels([label for label, _ in built])
+    columns: dict[str, dict[str, str]] = {
+        label: column for label, (_, column) in zip(labels, built)
+    }
 
     # Row order: coefficients in first-seen order across runs, then the stats.
     coef_order = list(dict.fromkeys(coefs["coefficient"]))

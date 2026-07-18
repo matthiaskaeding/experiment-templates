@@ -920,22 +920,40 @@ def test_etable_builds_cross_run_table_from_logged_info(tmp_path):
     mlflow.set_tracking_uri(f"sqlite:///{tmp_path}/mlflow.db")
     data = pf.get_data()
 
-    regress("Y ~ X1 + X2", data=data, vcov="iid", experiment_name="xrun")
-    regress("Y ~ X1 + X2", data=data, vcov="hetero", experiment_name="xrun")
-    regress("Y ~ X1 + X2 | f1", data=data, experiment_name="xrun")
+    regress("Y ~ X1 + X2", data=data, vcov="iid", name="iid", experiment_name="xrun")
+    regress(
+        "Y ~ X1 + X2", data=data, vcov="hetero", name="hetero", experiment_name="xrun"
+    )
+    regress("Y ~ X1 + X2 | f1", data=data, name="fe", experiment_name="xrun")
 
     table = etable("xrun")
 
-    assert list(table.columns) == ["(1)", "(2)", "(3)"]
+    # columns are headed by each run's name
+    assert list(table.columns) == ["iid", "hetero", "fe"]
     # coefficient cells look like "estimate<stars> (se)"
-    assert "(" in table.loc["X1", "(1)"] and "*" in table.loc["X1", "(1)"]
+    assert "(" in table.loc["X1", "iid"] and "*" in table.loc["X1", "iid"]
     # spec rows make each column self-describing; FEs are visible in fml
-    assert table.loc["vcov", "(1)"] == "iid"
-    assert table.loc["vcov", "(2)"] == "hetero"
-    assert table.loc["fml", "(3)"] == "Y ~ X1 + X2 | f1"
+    assert table.loc["vcov", "iid"] == "iid"
+    assert table.loc["vcov", "hetero"] == "hetero"
+    assert table.loc["fml", "fe"] == "Y ~ X1 + X2 | f1"
     # the FE model has no Intercept -> empty cell, not NaN
-    assert table.loc["Intercept", "(3)"] == ""
-    assert table.loc["nobs", "(1)"] == "998"
+    assert table.loc["Intercept", "fe"] == ""
+    assert table.loc["nobs", "iid"] == "998"
+
+
+def test_etable_columns_fall_back_to_abbreviated_formula(tmp_path):
+    mlflow.set_tracking_uri(f"sqlite:///{tmp_path}/mlflow.db")
+    data = pf.get_data()
+
+    # unnamed runs are headed by the formula's right-hand side; a repeated label
+    # gets a (2) suffix so the columns stay distinct
+    regress("Y ~ X1", data=data, vcov="iid", experiment_name="lab")
+    regress("Y ~ X1", data=data, vcov="hetero", experiment_name="lab")
+    regress("Y ~ X1 + X2", data=data, experiment_name="lab")
+
+    table = etable("lab")
+
+    assert list(table.columns) == ["X1", "X1 (2)", "X1 + X2"]
 
 
 def test_etable_markdown_output_escapes_formula_pipes(tmp_path):
