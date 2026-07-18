@@ -33,6 +33,27 @@ def test_regress_logs_single_model(tmp_path):
     assert run.data.params["data_shape"] == str(data.shape)
 
 
+def test_regress_logs_fit_summary_metrics(tmp_path):
+    mlflow.set_tracking_uri(f"sqlite:///{tmp_path}/mlflow.db")
+    data = pf.get_data()
+
+    fit = regress("Y ~ X1 + X2 | f1 + f2", data=data, experiment_name="fit-summary")
+
+    metrics = mlflow.last_active_run().data.metrics
+    # X1, X2 remain as coefficients (the two fixed effects are absorbed)
+    assert metrics["n_coefs"] == float(len(fit.tidy())) == 2.0
+    assert metrics["n_fes"] == 2.0
+    assert metrics["estimation_time"] >= 0.0
+
+
+def test_regress_logs_zero_fes_without_fixed_effects(tmp_path):
+    mlflow.set_tracking_uri(f"sqlite:///{tmp_path}/mlflow.db")
+
+    regress("Y ~ X1 + X2", data=pf.get_data(), experiment_name="no-fe")
+
+    assert mlflow.last_active_run().data.metrics["n_fes"] == 0.0
+
+
 def test_regress_logs_vcov_and_accepts_positional_args(tmp_path):
     mlflow.set_tracking_uri(f"sqlite:///{tmp_path}/mlflow.db")
     data = pf.get_data()
@@ -636,13 +657,48 @@ def test_coeftable_is_long_and_self_describing(tmp_path):
 
     # 2 runs x 3 coefficients (Intercept, X1, X2)
     assert len(table) == 6
-    assert set(table["Coefficient"]) == {"Intercept", "X1", "X2"}
-    # coefficient stats present
-    for col in ("Estimate", "Std. Error", "run_id"):
+    assert set(table["coefficient"]) == {"Intercept", "X1", "X2"}
+    # coefficient stats present, under standard snake_case names
+    for col in ("estimate", "std_error", "run_id"):
         assert col in table.columns
     # joined run params make each row self-describing
     assert "fml" in table.columns and "vcov" in table.columns
     assert set(table["vcov"]) == {"iid", "hetero"}
+
+
+def test_coeftable_has_standard_columns_in_presentation_order(tmp_path):
+    mlflow.set_tracking_uri(f"sqlite:///{tmp_path}/mlflow.db")
+    data = pf.get_data()
+
+    regress("Y ~ X1 + X2", data=data, vcov="iid", experiment_name="ct-cols")
+
+    table = coeftable("ct-cols")
+    # snake_case names, and the stat columns lead with estimate/SE/p-value/CI
+    # with the t (or z) statistic pushed to the right
+    stat_cols = [
+        c
+        for c in table.columns
+        if c not in ("run_id",)
+        and c
+        in {
+            "coefficient",
+            "estimate",
+            "std_error",
+            "p_value",
+            "ci_low",
+            "ci_high",
+            "t_value",
+        }
+    ]
+    assert stat_cols == [
+        "coefficient",
+        "estimate",
+        "std_error",
+        "p_value",
+        "ci_low",
+        "ci_high",
+        "t_value",
+    ]
 
 
 def test_coeftable_filters_by_coefficient(tmp_path):
@@ -653,11 +709,11 @@ def test_coeftable_filters_by_coefficient(tmp_path):
     regress("Y ~ X1 + X2", data=data, vcov="hetero", experiment_name="ct-filter")
 
     only_x1 = coeftable("ct-filter", coefficients="X1")
-    assert set(only_x1["Coefficient"]) == {"X1"}
+    assert set(only_x1["coefficient"]) == {"X1"}
     assert len(only_x1) == 2  # one X1 row per run
 
     x1_x2 = coeftable("ct-filter", coefficients=["X1", "X2"])
-    assert set(x1_x2["Coefficient"]) == {"X1", "X2"}
+    assert set(x1_x2["coefficient"]) == {"X1", "X2"}
     assert len(x1_x2) == 4
 
 
@@ -669,11 +725,11 @@ def test_coeftable_drops_coefficients(tmp_path):
     regress("Y ~ X1 + X2", data=data, vcov="hetero", experiment_name="ct-drop")
 
     no_intercept = coeftable("ct-drop", drop="Intercept")
-    assert set(no_intercept["Coefficient"]) == {"X1", "X2"}
+    assert set(no_intercept["coefficient"]) == {"X1", "X2"}
 
     # keep is applied before drop: keep {X1, X2}, then drop X2 -> only X1
     only_x1 = coeftable("ct-drop", coefficients=["X1", "X2"], drop="X2")
-    assert set(only_x1["Coefficient"]) == {"X1"}
+    assert set(only_x1["coefficient"]) == {"X1"}
 
 
 def test_coeftable_filter_string_selects_runs(tmp_path):

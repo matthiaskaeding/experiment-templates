@@ -50,17 +50,20 @@ columns, and `type="md"` returns markdown.
 `coeftable(experiment_name=None, coefficients=None, drop=None,
 filter_string=None)` reads each run's `coefficients.json` into one long
 coefficient-level frame (one row per run × coefficient, with the run's params
-joined on) — the quick way to get every coefficient across an experiment.
-`coefficients` / `drop` keep or remove coefficient rows and `filter_string`
-restricts which runs are included.
+joined on) — the quick way to get every coefficient across an experiment. Columns
+use plain snake_case names (`coefficient`, `estimate`, `std_error`, `p_value`,
+`ci_low` / `ci_high` for the 95% CI, `t_value`). `coefficients` / `drop` keep or
+remove coefficient rows and `filter_string` restricts which runs are included.
 
 ## What gets logged
 
 Each run logs the key parameters (`model_fn`, `fml`, `data_shape`, `vcov`),
 metrics appropriate to the model type (e.g. R² and F-statistic for OLS, pseudo
-R² and deviance for Poisson), the fitted coefficient table (`coefficients.json`),
-and a human-readable regression table (`summary.md`) built from the run's own
-logged info.
+R² and deviance for Poisson), a short summary of the fit itself (`n_coefs`,
+`n_fes` — the number of absorbed fixed effects — and `estimation_time` in
+seconds), the fitted coefficient table (`coefficients.json`), and a
+human-readable regression table (`summary.md`) built from the run's own logged
+info.
 
 Key coefficients are also logged as searchable numeric metrics — `coef.<name>`,
 `se.<name>`, `pvalue.<name>` — so you can filter, sort, and plot them in the

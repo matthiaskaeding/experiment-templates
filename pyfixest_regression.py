@@ -6,6 +6,7 @@ import hashlib
 import inspect
 import json
 import re
+import time
 import warnings
 from typing import Any, Callable
 
@@ -26,6 +27,9 @@ _MULTI_MODEL_ERROR = (
 # MLflow always auto-creates a "Default" experiment with this reserved id, and
 # silently falls back to it when no experiment is active. regress warns when a
 # run lands there (see below) so the fallback never goes unnoticed.
+# Metrics that are counts, rendered without decimals in the summary table.
+_INTEGER_METRICS = {"nobs", "n_coefs", "n_fes"}
+
 _DEFAULT_EXPERIMENT_ID = "0"
 _NO_EXPERIMENT_WARNING = (
     "No MLflow experiment is set; this run is being logged to the implicit "
@@ -93,6 +97,55 @@ def _bind_args(
     """Map positional/keyword call args to model_fn's parameter names."""
     bound = inspect.signature(model_fn).bind_partial(*args, **kwargs)
     return bound.arguments
+
+
+# pyfixest's tidy() uses display-style labels (``Estimate``, ``Std. Error``,
+# ``Pr(>|t|)``, ``2.5%`` ...). Log them under plain snake_case names that read
+# like a normal DataFrame, and in a presentation order that leads with the
+# estimate/SE/p-value/CI and pushes the t (or z) statistic to the right.
+_COEF_COLUMN_RENAME = {
+    "Coefficient": "coefficient",
+    "Estimate": "estimate",
+    "Std. Error": "std_error",
+    "t value": "t_value",
+    "Pr(>|t|)": "p_value",
+    "2.5%": "ci_low",
+    "97.5%": "ci_high",
+}
+_COEF_COLUMN_ORDER = (
+    "coefficient",
+    "estimate",
+    "std_error",
+    "p_value",
+    "ci_low",
+    "ci_high",
+    "t_value",
+)
+
+
+def _tidy_coefficients(fit: Any) -> pd.DataFrame:
+    """The fit's coefficient table with standard column names and order.
+
+    Renames pyfixest's tidy() labels to snake_case and reorders to
+    ``_COEF_COLUMN_ORDER`` (t/z statistic last). Any columns not in the map/order
+    are kept, appended after the known ones, so unusual estimators still round-trip.
+    """
+    table = fit.tidy().reset_index().rename(columns=_COEF_COLUMN_RENAME)
+    known = [c for c in _COEF_COLUMN_ORDER if c in table.columns]
+    rest = [c for c in table.columns if c not in known]
+    return table[known + rest]
+
+
+def _n_fixef(fit: Any) -> int:
+    """Number of fixed effects absorbed by the fit (0 if none).
+
+    pyfixest stores them as a ``+``-joined string on ``_fixef`` (e.g.
+    ``"firm + year"``), or None/empty when the model has no fixed effects.
+    """
+    fixef = getattr(fit, "_fixef", None)
+    if not fixef:
+        return 0
+    return len([part for part in fixef.split("+") if part.strip()])
 
 
 def _validate_key_coefs(key_coefs: str | list[str], fml: str) -> None:
@@ -333,22 +386,28 @@ def regress(
         # the run still records what was attempted (formula, hash, data shape,
         # vcov), gets an `error` tag with the exception, is marked FAILED by the
         # context manager, and the exception propagates to the caller.
+        start = time.perf_counter()
         try:
             fit = model_fn(*args, **kwargs)
         except Exception as exc:
             mlflow.set_tag("error", f"{type(exc).__name__}: {exc}"[:500])
             raise
+        estimation_time = time.perf_counter() - start
 
         if isinstance(fit, FixestMulti):
             raise ValueError(_MULTI_MODEL_ERROR)
 
         metrics = _extract_metrics(fit)
+        # Run-level summary of the fit itself: how long it took, how many
+        # coefficients it has, and how many fixed effects were absorbed.
+        metrics["estimation_time"] = estimation_time
+        metrics["n_coefs"] = float(len(fit.tidy()))
+        metrics["n_fes"] = float(_n_fixef(fit))
         mlflow.log_metrics(metrics)
 
         _log_key_coefficients(fit, _select_key_coefs(fit, key_coefs, n_key_coefs))
 
-        coef_table = fit.tidy().reset_index()
-        mlflow.log_table(coef_table, artifact_file="coefficients.json")
+        mlflow.log_table(_tidy_coefficients(fit), artifact_file="coefficients.json")
 
         # A human-readable regression table, alongside the tidy coefficients, to
         # eyeball runs in the MLflow UI (or anywhere markdown renders). Built from
@@ -407,7 +466,11 @@ def _summary_markdown(fit: Any, metrics: dict[str, float]) -> str:
         )
     lines += ["", "| Statistic | Value |", "|:---|---:|"]
     for stat, value in metrics.items():
-        formatted = f"{int(value)}" if stat == "nobs" else f"{value:.3f}"
+        # estimation_time is runtime, not a property of the estimate -- leave it out
+        # of the static summary (it also varies run to run).
+        if stat == "estimation_time":
+            continue
+        formatted = f"{int(value)}" if stat in _INTEGER_METRICS else f"{value:.3f}"
         lines.append(f"| {stat} | {formatted} |")
     lines.append(
         "\nSignificance: `*` p < 0.05, `**` p < 0.01, `***` p < 0.001. "
@@ -460,8 +523,8 @@ def etable(
         column: dict[str, str] = {}
         run_coefs = coefs[coefs["run_id"] == run["run_id"]]
         for _, c in run_coefs.iterrows():
-            cell = f"{c['Estimate']:.3f}{_stars(c['Pr(>|t|)'])} ({c['Std. Error']:.3f})"
-            column[c["Coefficient"]] = cell
+            cell = f"{c['estimate']:.3f}{_stars(c['p_value'])} ({c['std_error']:.3f})"
+            column[c["coefficient"]] = cell
         for stat in stat_rows:
             value = run.get(stat)
             if value is None or pd.isna(value):
@@ -475,7 +538,7 @@ def etable(
         columns[f"({i})"] = column
 
     # Row order: coefficients in first-seen order across runs, then the stats.
-    coef_order = list(dict.fromkeys(coefs["Coefficient"]))
+    coef_order = list(dict.fromkeys(coefs["coefficient"]))
     row_order = coef_order + [
         s for s in stat_rows if any(s in col for col in columns.values())
     ]
@@ -578,10 +641,10 @@ def coeftable(
 
     if coefficients is not None:
         names = [coefficients] if isinstance(coefficients, str) else list(coefficients)
-        table = table[table["Coefficient"].isin(names)]
+        table = table[table["coefficient"].isin(names)]
     if drop is not None:
         names = [drop] if isinstance(drop, str) else list(drop)
-        table = table[~table["Coefficient"].isin(names)]
+        table = table[~table["coefficient"].isin(names)]
 
     return table.reset_index(drop=True)
 
