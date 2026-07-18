@@ -9,6 +9,7 @@ from hashing import compute_experiment_hash
 from tracking import (
     _extract_metrics,
     coefficients_table,
+    etable,
     regress,
     results_table,
 )
@@ -218,33 +219,39 @@ def test_regress_reuses_already_active_experiment(tmp_path):
     assert fit._r2 is not None
 
 
-def test_regress_logs_etable_summary_artifact(tmp_path):
+def test_regress_logs_markdown_summary_artifact(tmp_path):
     mlflow.set_tracking_uri(f"sqlite:///{tmp_path}/mlflow.db")
     data = pf.get_data()
 
-    regress("Y ~ X1 + X2", data=data, experiment_name="etable-summary")
+    fit = regress("Y ~ X1 + X2", data=data, experiment_name="md-summary")
 
     run = mlflow.last_active_run()
     artifacts = mlflow.artifacts.list_artifacts(run_id=run.info.run_id)
-    paths = {a.path for a in artifacts}
-    assert "summary.html" in paths
+    assert "summary.md" in {a.path for a in artifacts}
+    # the summary is self-built from the fit's own info: coefficient rows,
+    # stats rows, and the formula header are all present
+    md = mlflow.artifacts.load_text(f"runs:/{run.info.run_id}/summary.md")
+    assert "Y ~ X1 + X2" in md
+    assert "| X1 " in md and "| nobs " in md
+    assert f"{fit._r2:.3f}" in md
 
 
-def test_regress_completes_when_etable_fails(tmp_path, monkeypatch):
+def test_regress_markdown_summary_works_for_all_model_types(tmp_path):
+    # The old pf.etable-based summary needed a try/except for unsupported model
+    # types; the self-built one must work for every estimator we support.
     mlflow.set_tracking_uri(f"sqlite:///{tmp_path}/mlflow.db")
     data = pf.get_data()
 
-    def boom(*args, **kwargs):
-        raise RuntimeError("etable exploded")
-
-    monkeypatch.setattr(pf, "etable", boom)
-
-    with pytest.warns(UserWarning, match="Could not log etable summary"):
-        fit = regress("Y ~ X1 + X2", data=data, experiment_name="etable-failure")
+    regress(
+        "Y ~ X1 + X2",
+        data=data,
+        model_fn=pf.quantreg,
+        experiment_name="md-quantreg",
+    )
 
     run = mlflow.last_active_run()
-    assert "nobs" in run.data.metrics
-    assert fit._r2 is not None
+    md = mlflow.artifacts.load_text(f"runs:/{run.info.run_id}/summary.md")
+    assert "| X1 " in md
 
 
 def test_extract_metrics_warns_on_missing_attribute():
@@ -638,3 +645,57 @@ def test_regress_failed_run_is_not_a_dedup_hit(tmp_path):
     runs = mlflow.search_runs(experiment_names=["flaky"], run_view_type=ViewType.ALL)
     assert set(runs["status"]) == {"FAILED", "FINISHED"}
     assert fit._r2 is not None
+
+
+# --- cross-run etable (#26) ---
+
+
+def test_etable_builds_cross_run_table_from_logged_info(tmp_path):
+    mlflow.set_tracking_uri(f"sqlite:///{tmp_path}/mlflow.db")
+    data = pf.get_data()
+
+    regress("Y ~ X1 + X2", data=data, vcov="iid", experiment_name="xrun")
+    regress("Y ~ X1 + X2", data=data, vcov="hetero", experiment_name="xrun")
+    regress("Y ~ X1 + X2 | f1", data=data, experiment_name="xrun")
+
+    table = etable("xrun")
+
+    assert list(table.columns) == ["(1)", "(2)", "(3)"]
+    # coefficient cells look like "estimate<stars> (se)"
+    assert "(" in table.loc["X1", "(1)"] and "*" in table.loc["X1", "(1)"]
+    # spec rows make each column self-describing; FEs are visible in fml
+    assert table.loc["vcov", "(1)"] == "iid"
+    assert table.loc["vcov", "(2)"] == "hetero"
+    assert table.loc["fml", "(3)"] == "Y ~ X1 + X2 | f1"
+    # the FE model has no Intercept -> empty cell, not NaN
+    assert table.loc["Intercept", "(3)"] == ""
+    assert table.loc["nobs", "(1)"] == "998"
+
+
+def test_etable_markdown_output_escapes_formula_pipes(tmp_path):
+    mlflow.set_tracking_uri(f"sqlite:///{tmp_path}/mlflow.db")
+    data = pf.get_data()
+
+    regress("Y ~ X1 | f1", data=data, experiment_name="xrun-md")
+
+    md = etable("xrun-md", type="md")
+
+    assert isinstance(md, str)
+    # the formula pipe must be escaped so the markdown table doesn't break
+    assert "Y ~ X1 \\| f1" in md
+
+
+def test_etable_filters_coefficients_and_handles_empty(tmp_path):
+    mlflow.set_tracking_uri(f"sqlite:///{tmp_path}/mlflow.db")
+    data = pf.get_data()
+
+    regress("Y ~ X1 + X2", data=data, experiment_name="xrun-filter")
+    only_x1 = etable("xrun-filter", coefficients="X1")
+    assert "X1" in only_x1.index and "X2" not in only_x1.index
+
+    mlflow.create_experiment("xrun-empty")
+    assert etable("xrun-empty").empty
+    assert etable("xrun-empty", type="md") == ""
+
+    with pytest.raises(ValueError, match="'df' or 'md'"):
+        etable("xrun-filter", type="html")

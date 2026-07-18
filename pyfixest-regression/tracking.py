@@ -285,7 +285,8 @@ def regress(
         if isinstance(fit, FixestMulti):
             raise ValueError(_MULTI_MODEL_ERROR)
 
-        mlflow.log_metrics(_extract_metrics(fit))
+        metrics = _extract_metrics(fit)
+        mlflow.log_metrics(metrics)
 
         if log_coefficients is not None:
             _log_coefficient_metrics(fit, log_coefficients)
@@ -294,17 +295,10 @@ def regress(
         mlflow.log_table(coef_table, artifact_file="coefficients.json")
 
         # A human-readable regression table, alongside the tidy coefficients, to
-        # eyeball runs in the MLflow UI. The summary is a nice-to-have, not the
-        # point of the run, so the whole block is failure-safe: both etable
-        # generation (not every model type is guaranteed to be supported) and the
-        # log_text upload are caught, so neither can fail the run or lose the fit.
-        # (The metric and coefficient-table logging above is deliberately not
-        # wrapped -- those failing should surface.)
-        try:
-            summary_html = pf.etable([fit], type="html")
-            mlflow.log_text(summary_html, "summary.html")
-        except Exception as exc:
-            warnings.warn(f"Could not log etable summary: {exc}", stacklevel=2)
+        # eyeball runs in the MLflow UI (or anywhere markdown renders). Built from
+        # the same information that is logged anyway, so it works for every model
+        # type -- no dependency on pf.etable supporting the fit.
+        mlflow.log_text(_summary_markdown(fit, metrics), "summary.md")
 
     return fit
 
@@ -316,6 +310,116 @@ def _resolve_model_fn(model_fn: Callable[..., Any] | str) -> Callable[..., Any]:
     if not callable(resolved):
         raise ValueError(f"Unknown pyfixest model function: {model_fn!r}")
     return resolved
+
+
+def _stars(pvalue: float) -> str:
+    if pvalue < 0.001:
+        return "***"
+    if pvalue < 0.01:
+        return "**"
+    if pvalue < 0.05:
+        return "*"
+    return ""
+
+
+def _md_escape(value: Any) -> str:
+    """Escape pipes so values (e.g. formulas like ``Y ~ X | f1``) survive
+    markdown table cells."""
+    return str(value).replace("|", "\\|")
+
+
+def _summary_markdown(fit: Any, metrics: dict[str, float]) -> str:
+    """Build the per-run regression table (markdown) from the fit's own info.
+
+    Uses the same tidy coefficient table and metrics that are logged anyway, so
+    it works for every model type -- unlike ``pf.etable``, which cannot be
+    applied after the fact and does not support all fits.
+    """
+    lines = [
+        f"### {_md_escape(getattr(fit, '_fml', type(fit).__name__))}",
+        "",
+        "| Coefficient | Estimate | Std. Error | p-value |",
+        "|:---|---:|---:|---:|",
+    ]
+    for coef_name, row in fit.tidy().iterrows():
+        pvalue = float(row["Pr(>|t|)"])
+        lines.append(
+            f"| {_md_escape(coef_name)} "
+            f"| {float(row['Estimate']):.3f}{_stars(pvalue)} "
+            f"| {float(row['Std. Error']):.3f} "
+            f"| {pvalue:.3f} |"
+        )
+    lines += ["", "| Statistic | Value |", "|:---|---:|"]
+    for stat, value in metrics.items():
+        formatted = f"{int(value)}" if stat == "nobs" else f"{value:.3f}"
+        lines.append(f"| {stat} | {formatted} |")
+    lines.append(
+        "\nSignificance: `*` p < 0.05, `**` p < 0.01, `***` p < 0.001. "
+        "Cells: estimate with stars; standard error and p-value alongside."
+    )
+    return "\n".join(lines)
+
+
+def etable(
+    experiment_name: str | None = None,
+    coefficients: str | list[str] | None = None,
+    type: str = "df",
+) -> pd.DataFrame | str:
+    """Build a cross-run regression table from the logged runs.
+
+    Reconstructs a side-by-side comparison -- one column per run (oldest first,
+    labeled ``(1)``, ``(2)``, ...), coefficient rows as ``estimate<stars> (se)``,
+    followed by spec/stat rows (``fml``, ``vcov``, ``nobs``, R2-style metrics) --
+    entirely from what ``regress`` logged (``coefficients.json`` + params +
+    metrics). Unlike ``pf.etable`` this works after the fact, across runs, for
+    every model type. Fixed effects show up in the ``fml`` row (e.g. ``| f1``).
+
+    ``coefficients`` (a name or list) keeps only those coefficient rows.
+    ``type="df"`` (default) returns a DataFrame; ``type="md"`` returns a
+    markdown string (with formula pipes escaped). Returns an empty
+    DataFrame/string if the experiment has no runs.
+    """
+    if type not in ("df", "md"):
+        raise ValueError(f"type must be 'df' or 'md', got {type!r}")
+
+    runs = results_table(experiment_name)
+    if runs.empty:
+        return runs if type == "df" else ""
+    coefs = coefficients_table(experiment_name, coefficients)
+
+    stat_rows = ("fml", "vcov", "nobs", "r2", "adj_r2", "pseudo_r2", "deviance")
+    columns: dict[str, dict[str, str]] = {}
+    # search_runs returns newest first; present oldest first as (1), (2), ...
+    for i, (_, run) in enumerate(runs.iloc[::-1].iterrows(), start=1):
+        column: dict[str, str] = {}
+        run_coefs = coefs[coefs["run_id"] == run["run_id"]]
+        for _, c in run_coefs.iterrows():
+            cell = f"{c['Estimate']:.3f}{_stars(c['Pr(>|t|)'])} ({c['Std. Error']:.3f})"
+            column[c["Coefficient"]] = cell
+        for stat in stat_rows:
+            value = run.get(stat)
+            if value is None or pd.isna(value):
+                continue
+            if stat == "nobs":
+                column[stat] = f"{int(value)}"
+            elif isinstance(value, float):
+                column[stat] = f"{value:.3f}"
+            else:
+                column[stat] = str(value)
+        columns[f"({i})"] = column
+
+    # Row order: coefficients in first-seen order across runs, then the stats.
+    coef_order = list(dict.fromkeys(coefs["Coefficient"]))
+    row_order = coef_order + [
+        s for s in stat_rows if any(s in col for col in columns.values())
+    ]
+    table = pd.DataFrame(columns).reindex(row_order).fillna("")
+
+    if type == "md":
+        escaped = table.map(_md_escape)
+        escaped.index = [_md_escape(i) for i in escaped.index]
+        return escaped.to_markdown()
+    return table
 
 
 def results_table(experiment_name: str | None = None) -> pd.DataFrame:
