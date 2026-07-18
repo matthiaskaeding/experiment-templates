@@ -5,7 +5,7 @@ import pyfixest as pf
 import pytest
 from mlflow.entities import ViewType
 
-from tracking import (
+from pyfixest_regression import (
     _extract_metrics,
     coefficients_table,
     compute_experiment_hash,

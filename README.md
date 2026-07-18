@@ -2,8 +2,9 @@
 
 Copy-paste templates for statistical experiments tracked with MLflow, as a flat
 collection of modules at the repository root. The pyfixest regression template
-is a single self-contained module, `tracking.py` (with `test_tracking.py` and
-`example.ipynb` alongside). This is not a Python package; the intended use is
+is a single self-contained module, `pyfixest_regression.py` (with
+`test_pyfixest_regression.py` and `example.ipynb` alongside). This is not a
+Python package; the intended use is
 copying the module file into your own project and working from there — one file,
 no intra-template imports to rewrite wherever it lands. The flat layout also
 keeps the door open for shared building blocks across templates — for example a
@@ -14,7 +15,7 @@ transformations — instead of isolating everything per folder.
 
 ```python
 import mlflow
-from tracking import regress, results_table
+from pyfixest_regression import regress, results_table
 
 mlflow.set_experiment("my-analysis")   # once per script
 
@@ -61,17 +62,18 @@ coefficients as searchable metrics (`coef.X1.estimate` / `.std_error` /
 From a clone:
 
 ```
-cp tracking.py path/to/your/project/
+cp pyfixest_regression.py path/to/your/project/
 ```
 
 Or without cloning at all, straight from GitHub into the current directory:
 
 ```
-curl -sSLO https://raw.githubusercontent.com/matthiaskaeding/experiment-templates/main/tracking.py
+curl -sSLO https://raw.githubusercontent.com/matthiaskaeding/experiment-templates/main/pyfixest_regression.py
 ```
 
 Either way, then install `mlflow` and `pyfixest` in that project. Grab
-`test_tracking.py` too if you want the tests; they run with plain `pytest`.
+`test_pyfixest_regression.py` too if you want the tests; they run with plain
+`pytest`.
 
 ## Development
 
