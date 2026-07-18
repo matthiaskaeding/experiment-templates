@@ -53,9 +53,16 @@ Each run logs the key parameters (`model_fn`, `fml`, `data_shape`, `vcov`),
 metrics appropriate to the model type (e.g. R² and F-statistic for OLS, pseudo
 R² and deviance for Poisson), the fitted coefficient table (`coefficients.json`),
 and a human-readable regression table (`summary.md`) built from the run's own
-logged info. Pass `log_coefficients=["X1", ...]` to additionally log selected
-coefficients as searchable metrics (`coef.X1.estimate` / `.std_error` /
-`.pvalue`) — opt-in, since models can have hundreds of dummy coefficients.
+logged info.
+
+Key coefficients are also logged as searchable numeric metrics — `coef.<name>`,
+`se.<name>`, `pvalue.<name>` — so you can filter, sort, and plot them in the
+MLflow UI (e.g. `search_runs(filter_string="metrics.\`coef.treat\` > 0")`). By
+default this covers the first `n_key_coefs=5` coefficients; pass
+`key_coefs="treat"` (or a list) to pick the ones you care about — the treatment
+effect usually isn't simply "first", since the intercept leads and `C()`/`i()`
+expansions reorder. Pass `n_key_coefs=0` to log none. The full coefficient table
+is always in `coefficients.json` regardless.
 
 ## Copying a template
 

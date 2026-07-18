@@ -130,7 +130,12 @@ def test_regress_logs_quantreg_metrics(tmp_path):
     run = mlflow.last_active_run()
     metrics = run.data.metrics
     assert run.data.params["model_fn"] == "quantreg"
-    assert metrics == {"nobs": fit._N}
+    # quantreg's only model-level metric is nobs (no r2/f-stat/deviance); the
+    # coef./se./pvalue. entries come from the default key-coefficient logging.
+    assert metrics["nobs"] == fit._N
+    assert not {"r2", "adj_r2", "f_statistic", "rmse", "deviance", "pseudo_r2"} & set(
+        metrics
+    )
 
 
 def test_regress_accepts_model_fn_as_string(tmp_path):
@@ -641,56 +646,101 @@ def test_coefficients_table_empty_experiment_returns_empty(tmp_path):
     assert coefficients_table("ct-empty").empty
 
 
-# --- log_coefficients ---
+# --- key coefficient logging ---
 
 
-def test_regress_logs_selected_coefficients_as_searchable_metrics(tmp_path):
+def test_regress_logs_first_n_key_coefs_by_default(tmp_path):
+    mlflow.set_tracking_uri(f"sqlite:///{tmp_path}/mlflow.db")
+    data = pf.get_data()
+
+    fit = regress("Y ~ X1 + X2", data=data, experiment_name="key-default")
+
+    run = mlflow.last_active_run()
+    metrics = run.data.metrics
+    tidy = fit.tidy()
+    # Y ~ X1 + X2 has 3 coefficients (fewer than the default 5), so each is
+    # logged as the numeric triple coef./se./pvalue.
+    for name in ["Intercept", "X1", "X2"]:
+        assert metrics[f"coef.{name}"] == float(tidy.loc[name, "Estimate"])
+        assert metrics[f"se.{name}"] == float(tidy.loc[name, "Std. Error"])
+        assert metrics[f"pvalue.{name}"] == float(tidy.loc[name, "Pr(>|t|)"])
+
+
+def test_regress_caps_key_coefs_at_n(tmp_path):
+    mlflow.set_tracking_uri(f"sqlite:///{tmp_path}/mlflow.db")
+    data = pf.get_data()
+
+    fit = regress("Y ~ X1 + X2", data=data, experiment_name="key-cap", n_key_coefs=2)
+
+    run = mlflow.last_active_run()
+    logged = {k for k in run.data.metrics if k.startswith("coef.")}
+    # only the first two coefficients in model order
+    first_two = list(fit.tidy().index[:2])
+    assert logged == {f"coef.{name}" for name in first_two}
+
+
+def test_regress_n_key_coefs_zero_logs_none(tmp_path):
+    mlflow.set_tracking_uri(f"sqlite:///{tmp_path}/mlflow.db")
+    data = pf.get_data()
+
+    regress("Y ~ X1 + X2", data=data, experiment_name="key-none", n_key_coefs=0)
+
+    run = mlflow.last_active_run()
+    coef_metrics = [
+        k for k in run.data.metrics if k.startswith(("coef.", "se.", "pvalue."))
+    ]
+    assert coef_metrics == []
+
+
+def test_regress_key_coefs_selects_named_coefficients(tmp_path):
     mlflow.set_tracking_uri(f"sqlite:///{tmp_path}/mlflow.db")
     data = pf.get_data()
 
     fit = regress(
         "Y ~ X1 + X2",
         data=data,
-        experiment_name="coef-metrics",
-        log_coefficients=["X1"],
+        experiment_name="key-named",
+        key_coefs="X1",
     )
 
     run = mlflow.last_active_run()
     metrics = run.data.metrics
     tidy = fit.tidy()
-    assert metrics["coef.X1.estimate"] == float(tidy.loc["X1", "Estimate"])
-    assert metrics["coef.X1.std_error"] == float(tidy.loc["X1", "Std. Error"])
-    assert metrics["coef.X1.pvalue"] == float(tidy.loc["X1", "Pr(>|t|)"])
-    # unselected coefficients are not logged as metrics
-    assert "coef.X2.estimate" not in metrics
+    assert metrics["coef.X1"] == float(tidy.loc["X1", "Estimate"])
+    assert metrics["se.X1"] == float(tidy.loc["X1", "Std. Error"])
+    assert metrics["pvalue.X1"] == float(tidy.loc["X1", "Pr(>|t|)"])
+    # naming coefficients overrides the first-n default, so nothing else is logged
+    assert "coef.X2" not in metrics
+    assert "coef.Intercept" not in metrics
 
     # the point of first-class logging: filterable in the MLflow store
+    estimate = float(tidy.loc["X1", "Estimate"])
     hits = mlflow.search_runs(
-        experiment_names=["coef-metrics"],
-        filter_string="metrics.`coef.X1.estimate` < 0",
+        experiment_names=["key-named"],
+        filter_string=f"metrics.`coef.X1` < {estimate + 1e-9}",
     )
     assert len(hits) == 1
 
 
-def test_regress_log_coefficients_sanitizes_awkward_names(tmp_path):
+def test_regress_key_coefs_sanitizes_awkward_names(tmp_path):
     mlflow.set_tracking_uri(f"sqlite:///{tmp_path}/mlflow.db")
     data = pf.get_data()
 
     fit = regress(
         "Y ~ X1 + C(f1)",
         data=data,
-        experiment_name="coef-sanitize",
-        log_coefficients="C(f1)[T.1.0]",
+        experiment_name="key-sanitize",
+        key_coefs="C(f1)[T.1.0]",
     )
 
     run = mlflow.last_active_run()
     # parens/brackets are illegal in MLflow metric keys and get replaced by _
-    key = "coef.C_f1__T.1.0_.estimate"
+    key = "coef.C_f1__T.1.0_"
     assert key in run.data.metrics
     assert run.data.metrics[key] == float(fit.tidy().loc["C(f1)[T.1.0]", "Estimate"])
 
 
-def test_regress_log_coefficients_warns_on_unknown_name(tmp_path):
+def test_regress_key_coefs_warns_on_unknown_name(tmp_path):
     mlflow.set_tracking_uri(f"sqlite:///{tmp_path}/mlflow.db")
     data = pf.get_data()
 
@@ -698,13 +748,13 @@ def test_regress_log_coefficients_warns_on_unknown_name(tmp_path):
         fit = regress(
             "Y ~ X1 + X2",
             data=data,
-            experiment_name="coef-unknown",
-            log_coefficients=["X1", "not_a_regressor"],
+            experiment_name="key-unknown",
+            key_coefs=["X1", "not_a_regressor"],
         )
 
     run = mlflow.last_active_run()
     # the known one is still logged; the run completes normally
-    assert "coef.X1.estimate" in run.data.metrics
+    assert "coef.X1" in run.data.metrics
     assert fit._r2 is not None
 
 
