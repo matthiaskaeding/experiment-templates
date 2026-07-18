@@ -777,6 +777,46 @@ def test_coeftable_empty_experiment_returns_empty(tmp_path):
     assert coeftable("ct-empty").empty
 
 
+# --- feature steps ---
+
+
+def test_regress_applies_and_logs_steps(tmp_path):
+    mlflow.set_tracking_uri(f"sqlite:///{tmp_path}/mlflow.db")
+    data = pf.get_data()
+
+    regress("Y ~ X1 + X2", data=data, steps=["standardize"], experiment_name="steps")
+
+    run = mlflow.last_active_run()
+    assert run.data.params["steps"] == "standardize@1"
+
+
+def test_regress_steps_are_part_of_the_hash(tmp_path):
+    mlflow.set_tracking_uri(f"sqlite:///{tmp_path}/mlflow.db")
+    data = pf.get_data()
+
+    # add_squares adds X1_sq but leaves the used columns (Y, X1, X2) untouched, so
+    # the two runs differ *only* by the steps tag -- proving steps enter the hash.
+    regress("Y ~ X1 + X2", data=data, experiment_name="steps-id")
+    regress("Y ~ X1 + X2", data=data, steps=["add_squares"], experiment_name="steps-id")
+
+    assert len(results_table("steps-id")) == 2
+
+
+def test_regress_same_steps_dedup(tmp_path):
+    mlflow.set_tracking_uri(f"sqlite:///{tmp_path}/mlflow.db")
+    data = pf.get_data()
+
+    regress("Y ~ X1", data=data, steps=["standardize"], experiment_name="steps-dup")
+    regress("Y ~ X1", data=data, steps=["standardize"], experiment_name="steps-dup")
+
+    assert len(results_table("steps-dup")) == 1
+
+
+def test_regress_steps_require_a_dataframe():
+    with pytest.raises(TypeError, match="DataFrame"):
+        regress("Y ~ X1", data=None, steps=["standardize"])
+
+
 # --- key coefficient logging ---
 
 

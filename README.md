@@ -3,13 +3,13 @@
 Copy-paste templates for statistical experiments tracked with MLflow, as a flat
 collection of modules at the repository root. The pyfixest regression template
 is a single self-contained module, `pyfixest_regression.py` (with
-`test_pyfixest_regression.py` and `pyfixest_regression_example.ipynb` alongside). This is not a
-Python package; the intended use is
-copying the module file into your own project and working from there — one file,
-no intra-template imports to rewrite wherever it lands. The flat layout also
-keeps the door open for shared building blocks across templates — for example a
-registry that different templates use to register reusable feature
-transformations — instead of isolating everything per folder.
+`test_pyfixest_regression.py` and `pyfixest_regression_example.ipynb` alongside),
+plus an optional `features.py` for versioned feature transformations. This is not
+a Python package; the intended use is copying the module file into your own
+project and working from there — one file, no intra-template imports to rewrite
+wherever it lands (`features.py` is imported only if you use `steps=`). The flat
+layout also keeps the door open for shared building blocks across templates — like
+that feature-transformation registry — instead of isolating everything per folder.
 
 ## Usage
 
@@ -79,6 +79,33 @@ default this covers the first `n_key_coefs=5` coefficients; pass
 effect usually isn't simply "first", since the intercept leads and `C()`/`i()`
 expansions reorder. Pass `n_key_coefs=0` to log none. The full coefficient table
 is always in `coefficients.json` regardless.
+
+## Feature transformations (`features.py`)
+
+`features.py` is a small registry of **versioned** data transformations. Register
+one with the `@feature(name, version)` decorator — it takes a DataFrame and
+returns a new one — then apply a pipeline of them with `regress(..., steps=[...])`:
+
+```python
+from features import feature
+from pyfixest_regression import regress
+
+@feature("winsorize_income", version="1")
+def winsorize_income(data):
+    out = data.copy()
+    lo, hi = out["income"].quantile([0.01, 0.99])
+    out["income"] = out["income"].clip(lo, hi)
+    return out
+
+regress("y ~ income", data=df, steps=["winsorize_income"])
+```
+
+The steps run in order before the fit, and their `name@version` tags are logged
+(the `steps` param) and folded into the run's content hash — so the data prep is
+part of the run's identity and **bumping a transform's version forces a re-log**.
+Two example transforms ship in the module: `standardize` and `add_squares`.
+`regress` imports `features.py` only when you pass `steps=`, so grab that file too
+if you want this.
 
 ## Copying a template
 
