@@ -33,6 +33,10 @@ to `feols`.
 DataFrame (one row per run, params and metrics with prefixes stripped); with no
 argument it reads the active experiment.
 
+`etable(experiment_name=None, coefficients=None, type="df")` rebuilds a
+side-by-side cross-run regression table (one column per run) from the logged
+runs; `type="md"` returns markdown.
+
 `coefficients_table(experiment_name=None, coefficients=None)` reads each run's
 `coefficients.json` into one long coefficient-level frame (one row per run ×
 coefficient, with the run's params joined on), optionally filtered to specific
@@ -43,8 +47,8 @@ coefficient names.
 Each run logs the key parameters (`model_fn`, `fml`, `data_shape`, `vcov`),
 metrics appropriate to the model type (e.g. R² and F-statistic for OLS, pseudo
 R² and deviance for Poisson), the fitted coefficient table (`coefficients.json`),
-and a human-readable regression table (`summary.html`) rendered with pyfixest's
-`etable`. Pass `log_coefficients=["X1", ...]` to additionally log selected
+and a human-readable regression table (`summary.md`) built from the run's own
+logged info. Pass `log_coefficients=["X1", ...]` to additionally log selected
 coefficients as searchable metrics (`coef.X1.estimate` / `.std_error` /
 `.pvalue`) — opt-in, since models can have hundreds of dummy coefficients.
 
