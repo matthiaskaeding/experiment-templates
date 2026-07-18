@@ -60,6 +60,6 @@ jobs:
 
       - name: Execute notebook and check it is in sync (outputs included)
         run: |
-          uv run jupyter execute example.ipynb --output=example.ipynb
-          uv run nbstripout --keep-output example.ipynb
-          git diff --exit-code -- example.ipynb
+          uv run jupyter execute pyfixest_regression_example.ipynb --output=pyfixest_regression_example.ipynb
+          uv run nbstripout --keep-output pyfixest_regression_example.ipynb
+          git diff --exit-code -- pyfixest_regression_example.ipynb

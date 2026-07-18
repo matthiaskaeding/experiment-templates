@@ -27,9 +27,9 @@ format-check: ## Check formatting without changing files
 
 check: lint format-check test ## Lint, check formatting, and test (the lint-and-test CI job)
 
-notebook: ## Re-execute example.ipynb and strip volatile metadata (the notebook CI job)
-	uv run jupyter execute example.ipynb --output=example.ipynb
-	uv run nbstripout --keep-output example.ipynb
+notebook: ## Re-execute pyfixest_regression_example.ipynb and strip volatile metadata (the notebook CI job)
+	uv run jupyter execute pyfixest_regression_example.ipynb --output=pyfixest_regression_example.ipynb
+	uv run nbstripout --keep-output pyfixest_regression_example.ipynb
 
 ui: ## Open the MLflow UI on the local mlflow.db
 	uv run mlflow ui --backend-store-uri sqlite:///mlflow.db
