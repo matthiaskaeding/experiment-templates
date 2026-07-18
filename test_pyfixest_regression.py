@@ -377,6 +377,118 @@ def test_model_params_key_order_does_not_change_hash():
     assert h1 == h2
 
 
+def test_unused_column_does_not_change_hash():
+    # Only the columns the model reads are hashed, so touching a column the
+    # formula never mentions must not change the hash.
+    data = pf.get_data()
+    params = {"fml": "Y ~ X1 + X2", "model_fn": "feols"}
+
+    h1 = compute_experiment_hash(data, params, global_version="v1")
+    changed = data.copy()
+    changed["f3"] = changed["f3"] + 1  # f3 is not in the formula
+    h2 = compute_experiment_hash(changed, params, global_version="v1")
+
+    assert h1 == h2
+
+
+def test_dropping_unused_column_does_not_change_hash():
+    data = pf.get_data()
+    params = {"fml": "Y ~ X1 + X2", "model_fn": "feols"}
+
+    h1 = compute_experiment_hash(data, params, global_version="v1")
+    h2 = compute_experiment_hash(data.drop(columns=["f3"]), params, global_version="v1")
+
+    assert h1 == h2
+
+
+def test_frame_column_order_does_not_change_hash():
+    # Used columns are hashed in sorted order, so reordering the frame's columns
+    # leaves the hash unchanged.
+    data = pf.get_data()
+    params = {"fml": "Y ~ X1 + X2", "model_fn": "feols"}
+
+    h1 = compute_experiment_hash(data, params, global_version="v1")
+    h2 = compute_experiment_hash(data[data.columns[::-1]], params, global_version="v1")
+
+    assert h1 == h2
+
+
+def test_fixed_effect_column_is_part_of_hash():
+    # Variables after `|` (fixed effects) are used columns.
+    data = pf.get_data()
+    params = {"fml": "Y ~ X1 | f1", "model_fn": "feols"}
+
+    h1 = compute_experiment_hash(data, params, global_version="v1")
+    changed = data.copy()
+    changed["f1"] = changed["f1"] + 1
+    h2 = compute_experiment_hash(changed, params, global_version="v1")
+
+    assert h1 != h2
+
+
+def test_iv_instrument_column_is_part_of_hash():
+    # Instruments after the IV `~` are used columns.
+    data = pf.get_data()
+    params = {"fml": "Y ~ X2 | X1 ~ Z1", "model_fn": "feols"}
+
+    h1 = compute_experiment_hash(data, params, global_version="v1")
+    changed = data.copy()
+    changed["Z1"] = changed["Z1"] + 1
+    h2 = compute_experiment_hash(changed, params, global_version="v1")
+
+    assert h1 != h2
+
+
+def test_cluster_column_is_part_of_hash_only_when_clustered():
+    # A cluster column named in a vcov dict is a used column; the same column is
+    # ignored when vcov does not reference it.
+    data = pf.get_data()
+    changed = data.copy()
+    changed["group_id"] = changed["group_id"] + 1
+
+    clustered = {"fml": "Y ~ X1", "vcov": {"CRV1": "group_id"}, "model_fn": "feols"}
+    assert compute_experiment_hash(
+        data, clustered, global_version="v1"
+    ) != compute_experiment_hash(changed, clustered, global_version="v1")
+
+    plain = {"fml": "Y ~ X1", "vcov": "hetero", "model_fn": "feols"}
+    assert compute_experiment_hash(
+        data, plain, global_version="v1"
+    ) == compute_experiment_hash(changed, plain, global_version="v1")
+
+
+def test_weights_column_is_part_of_hash_only_when_weighted():
+    data = pf.get_data()
+    changed = data.copy()
+    changed["weights"] = changed["weights"] * 2
+
+    weighted = {"fml": "Y ~ X1", "weights": "weights", "model_fn": "feols"}
+    assert compute_experiment_hash(
+        data, weighted, global_version="v1"
+    ) != compute_experiment_hash(changed, weighted, global_version="v1")
+
+    unweighted = {"fml": "Y ~ X1", "model_fn": "feols"}
+    assert compute_experiment_hash(
+        data, unweighted, global_version="v1"
+    ) == compute_experiment_hash(changed, unweighted, global_version="v1")
+
+
+def test_unextractable_columns_fall_back_to_full_frame_hash():
+    # If the used columns can't be determined, hashing falls back to the whole
+    # frame -- so even an "unrelated" column change then affects the hash. A
+    # formula that parses to multiple models is not a single-model spec, so
+    # extraction bails and the conservative full-frame hash is used.
+    data = pf.get_data()
+    params = {"fml": "Y + Y2 ~ X1", "model_fn": "feols"}
+
+    h1 = compute_experiment_hash(data, params, global_version="v1")
+    changed = data.copy()
+    changed["f3"] = changed["f3"] + 1
+    h2 = compute_experiment_hash(changed, params, global_version="v1")
+
+    assert h1 != h2
+
+
 # --- dedup wiring ---
 
 

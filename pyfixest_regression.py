@@ -210,14 +210,17 @@ def regress(
 
     Deduplication: when ``data`` is a DataFrame, a content hash of (data, model
     params including ``model_fn``, ``global_version``) is computed via
-    ``compute_experiment_hash`` and logged as the ``experiment_hash`` param. Before
-    logging, the active experiment is checked for a run with that same hash; if one
-    exists, this call skips logging entirely (no duplicate run is created). The
-    model is *always* re-fitted and returned either way -- only the MLflow logging
-    is skipped -- since MLflow stores metrics/artifacts, not the live fit object.
-    Note that logging configuration (``log_coefficients``) is not part of the
-    hash: an experiment already logged without coefficient metrics will be
-    skipped as a duplicate; bump ``global_version`` to force a re-log.
+    ``compute_experiment_hash`` and logged as the ``experiment_hash`` param. Only
+    the columns the model actually reads are hashed -- the formula variables plus
+    any cluster/weight/offset/split columns -- so adding or changing unrelated
+    columns in ``data`` does not create a spurious new run. Before logging, the
+    active experiment is checked for a run with that same hash; if one exists, this
+    call skips logging entirely (no duplicate run is created). The model is *always*
+    re-fitted and returned either way -- only the MLflow logging is skipped -- since
+    MLflow stores metrics/artifacts, not the live fit object. Note that logging
+    configuration (``log_coefficients``) is not part of the hash: an experiment
+    already logged without coefficient metrics will be skipped as a duplicate; bump
+    ``global_version`` to force a re-log.
     """
     model_fn = _resolve_model_fn(model_fn)
 
@@ -512,28 +515,104 @@ def compute_experiment_hash(
     The hash depends on:
     - ``data``: hashed by content (via ``pandas.util.hash_pandas_object``), so
       identical values always hash the same regardless of object identity or
-      whether the DataFrame was copied. The row index participates in the hash, so
-      a reindexed or reordered frame hashes differently even with identical values;
-      pass a frame with a stable index (e.g. ``reset_index(drop=True)``) if you want
-      order-only differences ignored.
+      whether the DataFrame was copied. Only the columns the model actually reads
+      are hashed (see ``_used_columns``): the formula variables plus the cluster,
+      weight, offset and split columns named in ``model_params``. Unrelated columns
+      in the frame therefore do not affect the hash, and the used columns are hashed
+      in sorted order so column order in the frame does not either. If the used
+      columns cannot be determined, the whole frame is hashed instead (conservative:
+      a smaller-but-wrong column set could collide two genuinely different runs).
+      The row index participates in the hash, so a reindexed or reordered frame
+      hashes differently even with identical values; pass a frame with a stable
+      index (e.g. ``reset_index(drop=True)``) if you want order-only differences
+      ignored.
     - ``model_params``: the model call's parameters (e.g. formula, vcov) *and* the
       modeling function's name, hashed via a deterministic JSON serialization. The
       function name is included so that, e.g., ``feols`` and ``quantreg`` on the
       same data and formula do not collide.
     - ``global_version``: an external version tag (e.g. a pipeline or
       dataset-build version) supplied by the caller.
+
+    Note: narrowing the data hash to the used columns changes the hash for every
+    experiment relative to older versions that hashed the whole frame, so each
+    previously logged run re-logs once after upgrading. Bump ``global_version`` if
+    you want that re-log to be explicit rather than incidental.
     """
     hasher = hashlib.sha256()
     hasher.update(str(global_version).encode())
-    hasher.update(_hash_data(data))
+    hasher.update(_hash_data(data, _used_columns(data, model_params)))
     hasher.update(_hash_model_params(model_params))
     return hasher.hexdigest()
 
 
-def _hash_data(data: pd.DataFrame) -> bytes:
-    columns = ",".join(map(str, data.columns))
-    row_hashes = pd.util.hash_pandas_object(data, index=True).to_numpy()
-    return columns.encode() + row_hashes.tobytes()
+def _hash_data(data: pd.DataFrame, columns: list[str] | None) -> bytes:
+    """Hash the given columns of ``data`` (or the whole frame if ``columns`` is
+    None), index included."""
+    frame = data if columns is None else data[columns]
+    col_repr = ",".join(map(str, frame.columns))
+    row_hashes = pd.util.hash_pandas_object(frame, index=True).to_numpy()
+    return col_repr.encode() + row_hashes.tobytes()
+
+
+def _used_columns(data: pd.DataFrame, model_params: dict[str, Any]) -> list[str] | None:
+    """The columns the model reads, as a sorted list, or None to hash everything.
+
+    A pyfixest call touches more of the frame than the bare formula variables:
+    besides everything in ``fml`` (transforms, interactions, fixed effects after
+    ``|``, IV instruments after a second ``|``), it reads the cluster columns named
+    in a ``vcov`` dict (e.g. ``{"CRV1": "firm"}``) and the ``weights`` / ``offset``
+    / ``split`` / ``fsplit`` columns. Formula variables are pulled with the same
+    parser pyfixest uses (``pyfixest``'s ``Formula.parse`` to split the spec, then
+    ``formulaic`` to list each part's variables) rather than a regex, so transforms
+    and interactions are handled correctly.
+
+    Returns None -- meaning "hash the whole frame" -- if anything about the
+    extraction fails or yields nothing usable. That is deliberately conservative:
+    over-hashing (including a column the model ignores) at worst logs a duplicate
+    run as distinct, whereas under-hashing (missing a column the model reads) would
+    let two genuinely different runs collide onto one hash and silently drop the
+    second.
+    """
+    try:
+        from formulaic import Formula as _FormulaicFormula
+
+        def _vars(expr: str | None) -> set[str]:
+            if not expr:
+                return set()
+            return set(_FormulaicFormula(expr).required_variables)
+
+        names: set[str] = set()
+
+        fml = model_params.get("fml")
+        if fml is not None:
+            parsed = Formula.parse(fml)
+            # A multi-model spec (e.g. sw()/csw() or several LHS variables) does
+            # not have one well-defined column set; bail to the full-frame hash.
+            if len(parsed) != 1:
+                return None
+            model = parsed[0]
+            for part in (model.second_stage, model.first_stage, model.fixed_effects):
+                names |= _vars(part)
+
+        vcov = model_params.get("vcov")
+        if isinstance(vcov, dict):
+            for cluster in vcov.values():
+                names |= _vars(cluster)
+
+        for key in ("weights", "offset", "split", "fsplit"):
+            value = model_params.get(key)
+            if isinstance(value, str):
+                names.add(value)
+
+        # Keep only real columns of this frame. formulaic reports function tokens
+        # as variables too (e.g. `i` from pyfixest's ``i(...)`` interaction), and a
+        # caller could name a column absent from the frame; intersecting drops both.
+        used = [str(c) for c in data.columns if c in names]
+        if not used:
+            return None
+        return sorted(used)  # sorted -> hash is invariant to frame column order
+    except Exception:
+        return None
 
 
 def _hash_model_params(model_params: dict[str, Any]) -> bytes:
