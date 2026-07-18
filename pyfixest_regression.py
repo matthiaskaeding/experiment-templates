@@ -95,34 +95,61 @@ def _bind_args(
     return bound.arguments
 
 
-def _log_coefficient_metrics(fit: Any, coefficients: str | list[str]) -> None:
-    """Log selected coefficients as first-class, searchable MLflow metrics.
+def _select_key_coefs(
+    fit: Any, key_coefs: str | list[str] | None, n_key_coefs: int
+) -> list[str]:
+    """The coefficient names to log as metrics.
 
-    For each requested coefficient present in ``fit.tidy()``, logs
-    ``coef.<name>.estimate``, ``coef.<name>.std_error``, and ``coef.<name>.pvalue``.
-    Coefficient names may contain characters MLflow disallows in metric keys
-    (e.g. ``C(f1)[T.1.0]``), so those are replaced with ``_`` in the key; a
-    requested name that is not in the model is skipped with a warning.
+    When ``key_coefs`` is given (a name or list), those are used -- names not in
+    the fitted model are dropped with a warning. Otherwise it falls back to the
+    first ``n_key_coefs`` coefficients in model order. The fallback is capped at
+    ``n_key_coefs`` on purpose: selecting by position is a convenience, and a
+    dummy- or fixed-effect-heavy spec can have hundreds of coefficients that
+    should not all become metrics. Position is not reliable for picking the
+    treatment effect (the intercept comes first, ``C()``/``i()`` expansions
+    reorder), which is exactly why ``key_coefs`` exists.
     """
-    names = [coefficients] if isinstance(coefficients, str) else list(coefficients)
+    index = list(fit.tidy().index)
+    if key_coefs is not None:
+        requested = [key_coefs] if isinstance(key_coefs, str) else list(key_coefs)
+        selected = []
+        for name in requested:
+            if name in index:
+                selected.append(name)
+            else:
+                warnings.warn(
+                    f"key_coefs: {name!r} is not a coefficient of the fitted "
+                    f"model; skipping.",
+                    stacklevel=3,
+                )
+        return selected
+    return index[: max(n_key_coefs, 0)]
+
+
+def _log_key_coefficients(fit: Any, coef_names: list[str]) -> None:
+    """Log each named coefficient as first-class, searchable MLflow metrics.
+
+    For every coefficient logs three *numeric* metrics -- ``coef.<name>`` (the
+    estimate), ``se.<name>`` (standard error), and ``pvalue.<name>`` -- so they
+    can be sorted, filtered, and plotted in the MLflow store/UI (e.g.
+    ``search_runs(filter_string='metrics.`coef.treat` > 0')``). Only numbers are
+    logged: stars and confidence intervals are presentation and are rendered from
+    these by ``results_table``/``etable``, and the complete, unsanitized
+    coefficient table always remains in the ``coefficients.json`` artifact.
+    Coefficient names may contain characters MLflow disallows in metric keys
+    (e.g. ``C(f1)[T.1.0]``), so those are replaced with ``_`` in the key.
+    """
+    if not coef_names:
+        return
     tidy = fit.tidy()
-    for coef_name in names:
-        if coef_name not in tidy.index:
-            warnings.warn(
-                f"log_coefficients: {coef_name!r} is not a coefficient of the "
-                f"fitted model; skipping.",
-                stacklevel=3,
-            )
-            continue
+    metrics = {}
+    for coef_name in coef_names:
         row = tidy.loc[coef_name]
         key = re.sub(r"[^\w\-. /]", "_", coef_name)
-        mlflow.log_metrics(
-            {
-                f"coef.{key}.estimate": float(row["Estimate"]),
-                f"coef.{key}.std_error": float(row["Std. Error"]),
-                f"coef.{key}.pvalue": float(row["Pr(>|t|)"]),
-            }
-        )
+        metrics[f"coef.{key}"] = float(row["Estimate"])
+        metrics[f"se.{key}"] = float(row["Std. Error"])
+        metrics[f"pvalue.{key}"] = float(row["Pr(>|t|)"])
+    mlflow.log_metrics(metrics)
 
 
 def _already_logged(experiment_hash: str) -> bool:
@@ -154,7 +181,8 @@ def regress(
     experiment_id: str | None = None,
     tags: dict[str, str] | None = None,
     global_version: str = "0",
-    log_coefficients: str | list[str] | None = None,
+    key_coefs: str | list[str] | None = None,
+    n_key_coefs: int = 5,
     **kwargs: Any,
 ) -> Any:
     """Call a pyfixest modeling function inside a tracked MLflow run.
@@ -199,14 +227,19 @@ def regress(
     all -- the run would land in MLflow's implicit "Default" experiment -- a
     ``UserWarning`` is issued and logging proceeds there.
 
-    ``log_coefficients`` (a coefficient name or list of names) additionally logs
-    those coefficients as first-class, searchable metrics --
-    ``coef.<name>.estimate`` / ``.std_error`` / ``.pvalue`` -- so they can be
-    filtered and sorted in the MLflow store/UI (e.g.
-    ``search_runs(filter_string='metrics.`coef.X1.estimate` > 0')``). It is
-    deliberately opt-in and scoped: models can have hundreds of dummy or
-    fixed-effect coefficients, and all of them always remain available via the
-    ``coefficients.json`` artifact regardless.
+    Key coefficients are logged as first-class, searchable metrics by default --
+    three numeric metrics each, ``coef.<name>`` (estimate) / ``se.<name>`` /
+    ``pvalue.<name>`` -- so they can be filtered, sorted, and plotted in the MLflow
+    store/UI (e.g. ``search_runs(filter_string='metrics.`coef.treat` > 0')``).
+    ``key_coefs`` (a coefficient name or list) picks which -- use it for the
+    coefficient you actually care about, e.g. a treatment effect, since selecting
+    by position is unreliable (the intercept comes first, ``C()``/``i()``
+    expansions reorder). When ``key_coefs`` is not given it falls back to the first
+    ``n_key_coefs`` coefficients (default 5); the cap matters because dummy- or
+    fixed-effect-heavy specs can have hundreds of coefficients. Pass
+    ``n_key_coefs=0`` (with no ``key_coefs``) to log none. Only numbers are logged
+    -- stars and CIs are rendered from them elsewhere -- and the complete
+    coefficient table always remains in the ``coefficients.json`` artifact.
 
     Deduplication: when ``data`` is a DataFrame, a content hash of (data, model
     params including ``model_fn``, ``global_version``) is computed via
@@ -218,9 +251,9 @@ def regress(
     call skips logging entirely (no duplicate run is created). The model is *always*
     re-fitted and returned either way -- only the MLflow logging is skipped -- since
     MLflow stores metrics/artifacts, not the live fit object. Note that logging
-    configuration (``log_coefficients``) is not part of the hash: an experiment
-    already logged without coefficient metrics will be skipped as a duplicate; bump
-    ``global_version`` to force a re-log.
+    configuration (``key_coefs`` / ``n_key_coefs``) is not part of the hash: an
+    experiment already logged with different key coefficients will still be skipped
+    as a duplicate; bump ``global_version`` to force a re-log.
     """
     model_fn = _resolve_model_fn(model_fn)
 
@@ -291,8 +324,7 @@ def regress(
         metrics = _extract_metrics(fit)
         mlflow.log_metrics(metrics)
 
-        if log_coefficients is not None:
-            _log_coefficient_metrics(fit, log_coefficients)
+        _log_key_coefficients(fit, _select_key_coefs(fit, key_coefs, n_key_coefs))
 
         coef_table = fit.tidy().reset_index()
         mlflow.log_table(coef_table, artifact_file="coefficients.json")
