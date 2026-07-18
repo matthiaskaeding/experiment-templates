@@ -41,11 +41,11 @@ jobs:
 
   notebook:
     # Re-execute the example notebook and fail if it drifts from what's
-    # committed. Outputs are non-deterministic (run ids, artifact paths,
-    # timestamps), so the notebook is committed with outputs stripped and this
-    # job strips again after executing: the diff then catches either an
-    # execution error (jupyter execute exits non-zero) or an un-committed code
-    # change, without false positives from volatile output.
+    # committed -- outputs included. The notebook is committed with outputs but
+    # with volatile metadata stripped (nbstripout --keep-output), and its cells
+    # suppress the remaining non-deterministic output sources (mlflow INFO
+    # logs, progress bars, run-id columns), so the diff catches execution
+    # errors, un-committed code changes, AND changed outputs.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -58,9 +58,9 @@ jobs:
       - name: Install dependencies (including dev group)
         run: uv sync --dev
 
-      - name: Execute notebook and check it is in sync
+      - name: Execute notebook and check it is in sync (outputs included)
         working-directory: pyfixest-regression
         run: |
           uv run jupyter execute example.ipynb --output=example.ipynb
-          uv run nbstripout example.ipynb
+          uv run nbstripout --keep-output example.ipynb
           git diff --exit-code -- example.ipynb
