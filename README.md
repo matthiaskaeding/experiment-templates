@@ -34,18 +34,25 @@ by their content (formula + data + settings) either way. `model_fn` accepts a
 pyfixest function or its name as a string, e.g. `model_fn="fepois"`; it defaults
 to `feols`.
 
-`results_table(experiment_name=None)` pulls the logged runs back as a tidy
-DataFrame (one row per run, params and metrics with prefixes stripped); with no
-argument it reads the active experiment.
+`results_table(experiment_name=None, filter_string=None)` pulls the logged runs
+back as a tidy DataFrame (one row per run, params and metrics with prefixes
+stripped); with no argument it reads the active experiment. `filter_string` is
+forwarded to `mlflow.search_runs` for arbitrary server-side filtering — by a
+run's name (`"tags.\`mlflow.runName\` = 'baseline'"`), a metric
+(`"metrics.r2 > 0.9"`), or a param.
 
-`etable(experiment_name=None, coefficients=None, type="df")` rebuilds a
-side-by-side cross-run regression table (one column per run) from the logged
-runs; `type="md"` returns markdown.
+`etable(experiment_name=None, coefficients=None, drop=None, filter_string=None,
+type="df")` rebuilds a side-by-side cross-run regression table (one column per
+run) from the logged runs; `coefficients` keeps only some rows, `drop` removes
+some (e.g. `drop="Intercept"`), `filter_string` restricts which runs become
+columns, and `type="md"` returns markdown.
 
-`coefficients_table(experiment_name=None, coefficients=None)` reads each run's
-`coefficients.json` into one long coefficient-level frame (one row per run ×
-coefficient, with the run's params joined on), optionally filtered to specific
-coefficient names.
+`coeftable(experiment_name=None, coefficients=None, drop=None,
+filter_string=None)` reads each run's `coefficients.json` into one long
+coefficient-level frame (one row per run × coefficient, with the run's params
+joined on) — the quick way to get every coefficient across an experiment.
+`coefficients` / `drop` keep or remove coefficient rows and `filter_string`
+restricts which runs are included.
 
 ## What gets logged
 
