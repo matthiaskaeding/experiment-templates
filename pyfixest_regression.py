@@ -20,8 +20,9 @@ from pyfixest.estimation.models.fepois_ import Fepois
 from pyfixest.estimation.quantreg.quantreg_ import Quantreg
 
 _MULTI_MODEL_ERROR = (
-    "regress only supports single-model results; the formula produced "
-    "multiple models (e.g. via sw()/csw() or multiple dependent variables)."
+    "regress produced multiple models from a single fit. Multi-model *formulas* "
+    "(csw()/sw() or several dependent variables) are supported and logged as one "
+    "run each; this looks like split=/fsplit=, which is not supported yet."
 )
 
 # MLflow always auto-creates a "Default" experiment with this reserved id, and
@@ -148,6 +149,18 @@ def _n_fixef(fit: Any) -> int:
     return len([part for part in fixef.split("+") if part.strip()])
 
 
+def _fit_metrics(fit: Any, estimation_time: float | None = None) -> dict[str, float]:
+    """Model metrics plus a run-level summary of the fit itself: how many
+    coefficients (``n_coefs``) and absorbed fixed effects (``n_fes``) it has, and
+    -- when timed -- how long it took (``estimation_time``)."""
+    metrics = _extract_metrics(fit)
+    if estimation_time is not None:
+        metrics["estimation_time"] = estimation_time
+    metrics["n_coefs"] = float(len(fit.tidy()))
+    metrics["n_fes"] = float(_n_fixef(fit))
+    return metrics
+
+
 def _validate_key_coefs(key_coefs: str | list[str], fml: str) -> None:
     """Raise if any name in ``key_coefs`` is not a variable of the formula.
 
@@ -263,10 +276,16 @@ def regress(
     All input validation happens before the MLflow run is opened, so a bad input
     never leaves a FAILED run behind: binding the call arguments (a signature
     mismatch raises ``TypeError``) and parsing the formula (a malformed formula
-    raises ``FormulaSyntaxError``) both run first. In particular, only single-model
-    results are supported: formulas that produce several models (e.g. via
-    ``sw()``/``csw()`` or multiple dependent variables) raise a ``ValueError``
-    before any run is opened; the returned object is also checked as a backstop.
+    raises ``FormulaSyntaxError``) both run first.
+
+    Multi-model formulas are supported as syntactic sugar: a formula that fans out
+    into several models (``csw()``/``sw()`` stepwise, or multiple dependent
+    variables) is fitted once and each resolved model is logged as its own run,
+    and the list of fitted models is returned. Every such run records the resolved
+    ``fml`` plus ``fml_original`` (the formula as written), so a sweep can be
+    grouped back together, and dedup is per resolved model. A single-model formula
+    returns the one fitted model as before. (``split=``/``fsplit=`` also produce
+    multiple models but are not supported and raise a ``ValueError``.)
 
     Estimation errors, by contrast, *are* recorded: the fit runs inside the MLflow
     run, after the parameters are logged. If ``model_fn`` raises, the run remains
@@ -335,8 +354,9 @@ def regress(
     data = bound_args.get("data")
     vcov = bound_args.get("vcov")
 
-    if fml is not None and len(Formula.parse(fml)) > 1:
-        raise ValueError(_MULTI_MODEL_ERROR)
+    # A multi-model formula (csw()/sw() or several dependent variables) fans out
+    # into one resolved model per spec; each is logged as its own run below.
+    is_multi = fml is not None and len(Formula.parse(fml)) > 1
 
     if key_coefs is not None and fml is not None:
         _validate_key_coefs(key_coefs, fml)
@@ -346,6 +366,22 @@ def regress(
     if experiment_name is not None or experiment_id is not None:
         mlflow.set_experiment(
             experiment_name=experiment_name, experiment_id=experiment_id
+        )
+    has_explicit_experiment = experiment_name is not None or experiment_id is not None
+
+    if is_multi:
+        return _log_multi(
+            model_fn(*args, **kwargs),
+            name=name,
+            tags=tags,
+            model_fn_name=getattr(model_fn, "__name__", str(model_fn)),
+            bound_args=bound_args,
+            data=data,
+            vcov=vcov,
+            global_version=global_version,
+            key_coefs=key_coefs,
+            n_key_coefs=n_key_coefs,
+            has_explicit_experiment=has_explicit_experiment,
         )
 
     experiment_hash = None
@@ -402,12 +438,7 @@ def regress(
         if isinstance(fit, FixestMulti):
             raise ValueError(_MULTI_MODEL_ERROR)
 
-        metrics = _extract_metrics(fit)
-        # Run-level summary of the fit itself: how long it took, how many
-        # coefficients it has, and how many fixed effects were absorbed.
-        metrics["estimation_time"] = estimation_time
-        metrics["n_coefs"] = float(len(fit.tidy()))
-        metrics["n_fes"] = float(_n_fixef(fit))
+        metrics = _fit_metrics(fit, estimation_time)
         mlflow.log_metrics(metrics)
 
         _log_key_coefficients(fit, _select_key_coefs(fit, key_coefs, n_key_coefs))
@@ -421,6 +452,83 @@ def regress(
         mlflow.log_text(_summary_markdown(fit, metrics), "summary.md")
 
     return fit
+
+
+def _log_multi(
+    fits: Any,
+    *,
+    name: str | None,
+    tags: dict[str, str] | None,
+    model_fn_name: str,
+    bound_args: dict[str, Any],
+    data: Any,
+    vcov: Any,
+    global_version: str,
+    key_coefs: str | list[str] | None,
+    n_key_coefs: int,
+    has_explicit_experiment: bool,
+) -> list[Any]:
+    """Log each model of a multi-model (csw/sw/multi-depvar) fit as its own run.
+
+    The whole thing is fitted once; then every resolved single model is logged
+    like a normal single-model run -- its own params, metrics, coefficients.json,
+    and summary.md. Each run records the resolved ``fml`` plus ``fml_original``
+    (the formula as written, e.g. ``Y ~ csw(X1, X2)``) so a sweep can be grouped
+    back together (``results_table`` filtered on ``fml_original``). Deduplication
+    is per resolved model -- the hash is over the resolved formula -- so re-running
+    the sweep is a no-op, and a model already fitted standalone is not logged
+    twice. Returns the list of fitted models. (``estimation_time`` is not logged
+    here: the models are fitted together, so there is no per-model time.)
+    """
+    original_fml = bound_args.get("fml")
+    results = []
+    warned = False
+    for sub in fits.to_list():
+        resolved_fml = sub._fml
+
+        experiment_hash = None
+        if isinstance(data, pd.DataFrame):
+            params = {k: v for k, v in bound_args.items() if k != "data"}
+            params["fml"] = resolved_fml
+            params["model_fn"] = model_fn_name
+            experiment_hash = compute_experiment_hash(data, params, global_version)
+
+        if experiment_hash is not None and _already_logged(experiment_hash):
+            results.append(sub)
+            continue
+
+        sub_name = f"{name} [{_abbrev_formula(resolved_fml)}]" if name else None
+        with mlflow.start_run(run_name=sub_name, tags=tags) as run:
+            if (
+                not has_explicit_experiment
+                and not warned
+                and run.info.experiment_id == _DEFAULT_EXPERIMENT_ID
+            ):
+                warnings.warn(_NO_EXPERIMENT_WARNING, stacklevel=3)
+                warned = True
+
+            mlflow.log_param("model_fn", model_fn_name)
+            if sub_name is not None:
+                mlflow.log_param("name", sub_name)
+            if experiment_hash is not None:
+                mlflow.log_param("experiment_hash", experiment_hash)
+            mlflow.log_param("fml", resolved_fml)
+            if original_fml is not None and original_fml != resolved_fml:
+                mlflow.log_param("fml_original", original_fml)
+            if isinstance(data, pd.DataFrame):
+                mlflow.log_param("data_shape", str(data.shape))
+            if vcov is not None:
+                mlflow.log_param("vcov", str(vcov))
+
+            metrics = _fit_metrics(sub)
+            mlflow.log_metrics(metrics)
+            _log_key_coefficients(sub, _select_key_coefs(sub, key_coefs, n_key_coefs))
+            mlflow.log_table(_tidy_coefficients(sub), artifact_file="coefficients.json")
+            mlflow.log_text(_summary_markdown(sub, metrics), "summary.md")
+
+        results.append(sub)
+
+    return results
 
 
 def _resolve_model_fn(model_fn: Callable[..., Any] | str) -> Callable[..., Any]:

@@ -67,31 +67,57 @@ def test_regress_logs_vcov_and_accepts_positional_args(tmp_path):
     assert fit._vcov_type == "hetero"
 
 
-def test_regress_rejects_multi_model_formula(tmp_path):
+def test_regress_csw_logs_one_run_per_model(tmp_path):
     mlflow.set_tracking_uri(f"sqlite:///{tmp_path}/mlflow.db")
     data = pf.get_data()
 
-    with pytest.raises(ValueError, match="single-model"):
-        regress("Y ~ csw(X1, X2)", data=data, experiment_name="csw-formula")
+    fits = regress("Y ~ csw(X1, X2)", data=data, name="sweep", experiment_name="csw")
+
+    # a multi-model formula returns the list of fitted models ...
+    assert isinstance(fits, list)
+    assert len(fits) == 2
+
+    # ... and logs each resolved model as its own run, tagged with the original
+    runs = results_table("csw")
+    assert len(runs) == 2
+    assert set(runs["fml"]) == {"Y ~ X1", "Y ~ X1 + X2"}
+    assert set(runs["fml_original"]) == {"Y ~ csw(X1, X2)"}
+    # the run name carries the user's name plus the resolved spec
+    assert set(runs["name"]) == {"sweep [X1]", "sweep [X1 + X2]"}
 
 
-def test_regress_rejects_multi_model_formula_before_fitting(tmp_path):
+def test_regress_csw_dedups_on_resolved_model(tmp_path):
     mlflow.set_tracking_uri(f"sqlite:///{tmp_path}/mlflow.db")
     data = pf.get_data()
 
-    # These columns don't exist, so an actual fit would raise a pyfixest formula
-    # error instead. Getting our ValueError proves the formula was inspected
-    # before model_fn was ever called.
-    with pytest.raises(ValueError, match="single-model"):
-        regress(
-            "Y ~ csw(does_not_exist_1, does_not_exist_2)",
-            data=data,
-            experiment_name="csw-formula-precheck",
-        )
+    regress("Y ~ csw(X1, X2)", data=data, experiment_name="csw-dedup")
+    # re-running the same sweep is a no-op: dedup is per resolved model
+    regress("Y ~ csw(X1, X2)", data=data, experiment_name="csw-dedup")
 
-    # The formula is rejected before any MLflow run is opened, so this fresh
-    # tracking store must contain no runs (no FAILED run left behind).
-    assert mlflow.search_runs(search_all_experiments=True).empty
+    assert len(results_table("csw-dedup")) == 2
+
+
+def test_regress_csw_dedups_against_standalone_run(tmp_path):
+    mlflow.set_tracking_uri(f"sqlite:///{tmp_path}/mlflow.db")
+    data = pf.get_data()
+
+    # a model fitted standalone is not logged again when it reappears in a sweep
+    regress("Y ~ X1", data=data, experiment_name="csw-mix")
+    fits = regress("Y ~ csw(X1, X2)", data=data, experiment_name="csw-mix")
+
+    assert len(fits) == 2  # both models are returned ...
+    runs = results_table("csw-mix")
+    assert len(runs) == 2  # ... but only the new resolved model is newly logged
+    assert set(runs["fml"]) == {"Y ~ X1", "Y ~ X1 + X2"}
+
+
+def test_regress_rejects_split(tmp_path):
+    mlflow.set_tracking_uri(f"sqlite:///{tmp_path}/mlflow.db")
+    data = pf.get_data()
+
+    # split=/fsplit= also fan out into multiple models but are not supported yet
+    with pytest.raises(ValueError, match="split"):
+        regress("Y ~ X1", data=data, split="f1", experiment_name="split-x")
 
 
 def test_regress_accepts_explicit_model_fn(tmp_path):

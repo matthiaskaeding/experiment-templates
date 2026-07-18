@@ -34,6 +34,12 @@ by their content (formula + data + settings) either way. `model_fn` accepts a
 pyfixest function or its name as a string, e.g. `model_fn="fepois"`; it defaults
 to `feols`.
 
+Multi-model formulas work too: a stepwise `csw()`/`sw()` sweep (or several
+dependent variables) is fitted once and logged as one run per resolved model,
+and `regress` returns the list of fits. Each run records the resolved `fml` plus
+`fml_original` (the formula as written), so `etable("exp")` lines the sweep up
+side by side and `results_table` can group it via `fml_original`.
+
 `results_table(experiment_name=None, filter_string=None)` pulls the logged runs
 back as a tidy DataFrame (one row per run, params and metrics with prefixes
 stripped); with no argument it reads the active experiment. `filter_string` is
