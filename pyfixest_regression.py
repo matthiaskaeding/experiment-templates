@@ -264,6 +264,7 @@ def regress(
     global_version: str = "0",
     key_coefs: str | list[str] | None = None,
     n_key_coefs: int = 5,
+    steps: list[str] | None = None,
     **kwargs: Any,
 ) -> Any:
     """Call a pyfixest modeling function inside a tracked MLflow run.
@@ -331,6 +332,14 @@ def regress(
     -- and the complete coefficient table always remains in the
     ``coefficients.json`` artifact.
 
+    ``steps`` (a list of names from the ``features`` registry) applies those
+    feature transformations to ``data``, in order, before fitting -- e.g.
+    ``steps=["standardize"]``. The applied ``name@version`` tags are logged as the
+    ``steps`` param and folded into the hash, so the data preparation is part of
+    the run's identity and bumping a transform's version forces a re-log. The
+    ``features`` module is imported only when ``steps`` are given, so the template
+    still works as a single file otherwise.
+
     Deduplication: when ``data`` is a DataFrame, a content hash of (data, model
     params including ``model_fn``, ``global_version``) is computed via
     ``compute_experiment_hash`` and logged as the ``experiment_hash`` param. Only
@@ -353,6 +362,24 @@ def regress(
     fml = bound_args.get("fml")
     data = bound_args.get("data")
     vcov = bound_args.get("vcov")
+
+    # Feature steps: apply the named transforms (from the features registry) to
+    # the data before fitting, and substitute the transformed frame back into the
+    # call so the fit sees it. The applied name@version tags become part of the
+    # run's identity (logged and hashed), so a version bump forces a re-log.
+    applied_steps: list[str] = []
+    if steps:
+        if not isinstance(data, pd.DataFrame):
+            raise TypeError("steps require `data` to be a pandas DataFrame")
+        from features import apply_steps as _apply_steps
+
+        data, applied_steps = _apply_steps(data, steps)
+        bound_args["data"] = data
+        if "data" in kwargs:
+            kwargs = {**kwargs, "data": data}
+        else:
+            idx = list(inspect.signature(model_fn).parameters).index("data")
+            args = tuple(data if i == idx else a for i, a in enumerate(args))
 
     # A multi-model formula (csw()/sw() or several dependent variables) fans out
     # into one resolved model per spec; each is logged as its own run below.
@@ -381,6 +408,7 @@ def regress(
             global_version=global_version,
             key_coefs=key_coefs,
             n_key_coefs=n_key_coefs,
+            applied_steps=applied_steps,
             has_explicit_experiment=has_explicit_experiment,
         )
 
@@ -388,6 +416,8 @@ def regress(
     if isinstance(data, pd.DataFrame):
         model_params = {k: v for k, v in bound_args.items() if k != "data"}
         model_params["model_fn"] = getattr(model_fn, "__name__", str(model_fn))
+        if applied_steps:
+            model_params["steps"] = applied_steps
         experiment_hash = compute_experiment_hash(data, model_params, global_version)
 
     # Dedup hit: skip all logging (no new run), but still fit and return the model.
@@ -414,6 +444,8 @@ def regress(
         # from a random one; the param is present only when the user named the run).
         if name is not None:
             mlflow.log_param("name", name)
+        if applied_steps:
+            mlflow.log_param("steps", ",".join(applied_steps))
         if experiment_hash is not None:
             mlflow.log_param("experiment_hash", experiment_hash)
         if fml is not None:
@@ -466,6 +498,7 @@ def _log_multi(
     global_version: str,
     key_coefs: str | list[str] | None,
     n_key_coefs: int,
+    applied_steps: list[str],
     has_explicit_experiment: bool,
 ) -> list[Any]:
     """Log each model of a multi-model (csw/sw/multi-depvar) fit as its own run.
@@ -491,6 +524,8 @@ def _log_multi(
             params = {k: v for k, v in bound_args.items() if k != "data"}
             params["fml"] = resolved_fml
             params["model_fn"] = model_fn_name
+            if applied_steps:
+                params["steps"] = applied_steps
             experiment_hash = compute_experiment_hash(data, params, global_version)
 
         if experiment_hash is not None and _already_logged(experiment_hash):
@@ -510,6 +545,8 @@ def _log_multi(
             mlflow.log_param("model_fn", model_fn_name)
             if sub_name is not None:
                 mlflow.log_param("name", sub_name)
+            if applied_steps:
+                mlflow.log_param("steps", ",".join(applied_steps))
             if experiment_hash is not None:
                 mlflow.log_param("experiment_hash", experiment_hash)
             mlflow.log_param("fml", resolved_fml)
