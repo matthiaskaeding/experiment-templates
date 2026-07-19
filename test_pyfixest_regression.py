@@ -775,6 +775,32 @@ def test_regress_steps_require_a_dataframe():
         regress("Y ~ X1", data=None, steps=["standardize"])
 
 
+def test_regress_step_failure_is_a_failed_run(tmp_path):
+    mlflow.set_tracking_uri(f"sqlite:///{tmp_path}/mlflow.db")
+    data = pf.get_data()  # X1 is ~N(0, 1) -> has non-positive values
+
+    # the data transform runs inside the run, so a step that fails on the data
+    # (log of non-positive values) is recorded as a FAILED run, not raised before
+    # anything is logged
+    with pytest.raises(ValueError, match="non-positive"):
+        regress(
+            "Y ~ X1",
+            data=data,
+            steps=[("log", {"columns": ["X1"]})],
+            experiment_name="step-fail",
+        )
+
+    runs = mlflow.search_runs(
+        experiment_names=["step-fail"], run_view_type=ViewType.ALL
+    )
+    assert len(runs) == 1
+    row = runs.iloc[0]
+    assert row["status"] == "FAILED"
+    # the steps tag was logged before the failure, and the error is captured
+    assert row["params.steps"].startswith("log@1")
+    assert "non-positive" in row["tags.error"]
+
+
 # --- key coefficient logging ---
 
 
