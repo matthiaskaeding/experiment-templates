@@ -29,10 +29,17 @@ the script (or set the `MLFLOW_EXPERIMENT_NAME` environment variable) and let
 runs land in the active experiment; alternatively pass `experiment_name=` or
 `experiment_id=` per call. If no experiment is set at all, a warning is issued
 and the run lands in MLflow's "Default" experiment. `name` is an optional
-descriptor of the regression, used as the MLflow run name — runs are identified
-by their content (formula + data + settings) either way. `model_fn` accepts a
+descriptor of the regression, used as the MLflow run name. `model_fn` accepts a
 pyfixest function or its name as a string, e.g. `model_fn="fepois"`; it defaults
 to `feols`.
+
+`data` is dataframe-agnostic — pandas, **polars**, or anything pyfixest accepts
+(via narwhals) — and is passed to the fit as given. Runs are identified for
+deduplication by a content hash of the model settings plus `dataset_version` (a
+string you supply, default `"v1"`) — **the data itself is not hashed**, so you
+assert which version of the data a run used and bump `dataset_version` when the
+underlying data changes. `global_version` is a separate general knob to force a
+re-log.
 
 Multi-model formulas work too: a stepwise `csw()`/`sw()` sweep (or several
 dependent variables) is fitted once and logged as one run per resolved model,
@@ -40,30 +47,37 @@ and `regress` returns the list of fits. Each run records the resolved `fml` plus
 `fml_original` (the formula as written), so `etable("exp")` lines the sweep up
 side by side and `results_table` can group it via `fml_original`.
 
-`results_table(experiment_name=None, filter_string=None)` pulls the logged runs
-back as a tidy DataFrame (one row per run, params and metrics with prefixes
-stripped); with no argument it reads the active experiment. `filter_string` is
-forwarded to `mlflow.search_runs` for arbitrary server-side filtering — by a
-run's name (`"tags.\`mlflow.runName\` = 'baseline'"`), a metric
+The table helpers below return **polars** by default; pass `backend="pandas"`
+for pandas.
+
+`results_table(experiment_name=None, filter_string=None, backend="polars")` pulls
+the logged runs back as a tidy DataFrame (one row per run, params and metrics with
+prefixes stripped); with no argument it reads the active experiment.
+`filter_string` is forwarded to `mlflow.search_runs` for arbitrary server-side
+filtering — by a run's name (`"tags.\`mlflow.runName\` = 'baseline'"`), a metric
 (`"metrics.r2 > 0.9"`), or a param.
 
 `etable(experiment_name=None, coefficients=None, drop=None, filter_string=None,
-type="df")` rebuilds a side-by-side cross-run regression table (one column per
-run) from the logged runs; `coefficients` keeps only some rows, `drop` removes
-some (e.g. `drop="Intercept"`), `filter_string` restricts which runs become
-columns, and `type="md"` returns markdown.
+type="df", backend="polars")` rebuilds a side-by-side cross-run regression table
+(one column per run) from the logged runs; `coefficients` keeps only some rows,
+`drop` removes some (e.g. `drop="Intercept"`), `filter_string` restricts which
+runs become columns, and `type="md"` returns markdown. In polars the row labels
+(coefficients and stats) become a leading `term` column, since polars has no row
+index.
 
 `coeftable(experiment_name=None, coefficients=None, drop=None,
-filter_string=None)` reads each run's `coefficients.json` into one long
-coefficient-level frame (one row per run × coefficient, with the run's params
-joined on) — the quick way to get every coefficient across an experiment. Columns
-use plain snake_case names (`coefficient`, `estimate`, `std_error`, `p_value`,
-`ci_low` / `ci_high` for the 95% CI, `t_value`). `coefficients` / `drop` keep or
-remove coefficient rows and `filter_string` restricts which runs are included.
+filter_string=None, backend="polars")` reads each run's `coefficients.json` into
+one long coefficient-level frame (one row per run × coefficient, with the run's
+params joined on) — the quick way to get every coefficient across an experiment.
+Columns use plain snake_case names (`coefficient`, `estimate`, `std_error`,
+`p_value`, `ci_low` / `ci_high` for the 95% CI, `t_value`). `coefficients` /
+`drop` keep or remove coefficient rows and `filter_string` restricts which runs
+are included.
 
 ## What gets logged
 
-Each run logs the key parameters (`model_fn`, `fml`, `data_shape`, `vcov`),
+Each run logs the key parameters (`model_fn`, `fml`, `data_shape`, `vcov`,
+`dataset_version`, `experiment_hash`),
 metrics appropriate to the model type (e.g. R² and F-statistic for OLS, pseudo
 R² and deviance for Poisson), a short summary of the fit itself (`n_coefs`,
 `n_fes` — the number of absorbed fixed effects — and `estimation_time` in
@@ -121,9 +135,9 @@ Or without cloning at all, straight from GitHub into the current directory:
 curl -sSLO https://raw.githubusercontent.com/matthiaskaeding/experiment-templates/main/pyfixest_regression.py
 ```
 
-Either way, then install `mlflow` and `pyfixest` in that project. Grab
-`test_pyfixest_regression.py` too if you want the tests; they run with plain
-`pytest`.
+Either way, then install `mlflow`, `pyfixest`, and `polars` in that project
+(`narwhals` comes with pyfixest). Grab `test_pyfixest_regression.py` too if you
+want the tests; they run with plain `pytest`.
 
 ## Development
 
