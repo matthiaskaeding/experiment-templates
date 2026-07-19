@@ -201,6 +201,20 @@ def test_fit_transform_equals_fit_then_transform():
     pd.testing.assert_frame_equal(a, b)
 
 
+def test_params_gives_helpful_error_on_misnamed_attribute():
+    @feature("_misnamed_attr", version="1")
+    class _Misnamed(FeatureTransform):
+        def __init__(self, columns):
+            self.col = columns  # bug: attribute name != constructor arg name
+
+        def _transform(self, df):
+            return df
+
+    t = _Misnamed(columns=["x"])
+    with pytest.raises(AttributeError, match=r"expected attribute 'columns'"):
+        _ = t.params
+
+
 def test_tag_format_sorts_param_keys_and_shows_resolved_defaults():
     df = pd.DataFrame({"income": [10.0, 20.0, 30.0]})
 

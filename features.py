@@ -66,13 +66,30 @@ class FeatureTransform(ABC):
         """The configuration this transform was built with, derived from its
         ``__init__`` signature: every parameter except ``self``, read off the
         instance. Lets ``from_state(t.state, **t.params)`` rebuild a fitted
-        transform without a separately stored params dict."""
+        transform without a separately stored params dict.
+
+        This requires each constructor argument to be stored on ``self`` under the
+        *same* name; if one isn't (e.g. ``__init__(self, columns)`` that does
+        ``self.col = columns``), a clear ``AttributeError`` explains the fix instead
+        of a bare missing-attribute error.
+        """
         names = [
             name
             for name in inspect.signature(type(self).__init__).parameters
             if name != "self"
         ]
-        return {name: getattr(self, name) for name in names}
+        params = {}
+        for name in names:
+            try:
+                params[name] = getattr(self, name)
+            except AttributeError:
+                raise AttributeError(
+                    f"{type(self).__name__}.params expected attribute {name!r} "
+                    f"(a parameter of __init__), but it is not set. Store each "
+                    f"constructor argument on self under the same name, e.g. "
+                    f"`self.{name} = {name}`."
+                ) from None
+        return params
 
     def fit(self, train: pd.DataFrame) -> FeatureTransform:
         """Default for stateless transforms: learn nothing, but mark as fitted by
