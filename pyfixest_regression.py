@@ -312,7 +312,7 @@ def regress(
     global_version: str = "0",
     key_coefs: str | list[str] | None = None,
     n_key_coefs: int = 5,
-    steps: list[str] | None = None,
+    steps: list[str | tuple[str, dict]] | None = None,
     dataset_version: str = "v1",
     **kwargs: Any,
 ) -> Any:
@@ -383,14 +383,15 @@ def regress(
 
     ``data`` is dataframe-agnostic: pandas, polars, or anything pyfixest accepts
     (via narwhals) works, and the fit receives it as given. ``steps`` (a list of
-    names from the ``features`` registry) applies those feature transformations to
-    ``data``, in order, before fitting -- e.g. ``steps=["standardize"]``; steps run
-    in pandas, so with a non-pandas frame the transformed data is passed on as
-    pandas. The applied ``name@version`` tags are logged as the ``steps`` param and
-    folded into the hash, so the data preparation is part of the run's identity and
-    bumping a transform's version forces a re-log. The ``features`` module is
-    imported only when ``steps`` are given, so the template still works as a single
-    file otherwise.
+    names -- or ``(name, params)`` pairs -- from the ``features`` registry, e.g.
+    ``steps=["standardize", ("log", {"columns": ["income"]})]``) fits and applies
+    those feature transformations to ``data``, in order, before fitting (via
+    ``features.fit_steps``); steps run in pandas, so with a non-pandas frame the
+    transformed data is passed on as pandas. The applied ``name@version`` tags are
+    logged as the ``steps`` param and folded into the hash, so the data preparation
+    is part of the run's identity and bumping a transform's version forces a
+    re-log. The ``features`` module is imported only when ``steps`` are given, so
+    the template still works as a single file otherwise.
 
     Deduplication: a hash of (``dataset_version``, model params including
     ``model_fn`` and any ``steps``, ``global_version``) is computed via
@@ -424,9 +425,9 @@ def regress(
         data_pd = _to_pandas(data)
         if data_pd is None:
             raise TypeError("steps require `data` to be a dataframe")
-        from features import apply_steps as _apply_steps
+        from features import fit_steps as _fit_steps
 
-        data, applied_steps = _apply_steps(data_pd, steps)
+        data, _states, applied_steps = _fit_steps(data_pd, steps)
         bound_args["data"] = data
         if "data" in kwargs:
             kwargs = {**kwargs, "data": data}

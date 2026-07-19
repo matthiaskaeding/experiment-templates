@@ -96,30 +96,57 @@ is always in `coefficients.json` regardless.
 
 ## Feature transformations (`features.py`)
 
-`features.py` is a small registry of **versioned** data transformations. Register
-one with the `@feature(name, version)` decorator — it takes a DataFrame and
-returns a new one — then apply a pipeline of them with `regress(..., steps=[...])`:
+`features.py` is a small framework for **versioned, JSON-serializable** feature
+engineering — transforms you can *fit* on training data, *serialize* to JSON, and
+*replay* exactly during serving. A transform is a `FeatureTransform` subclass:
+implement `_transform` (required), and override `fit` only if it learns something
+from the data (`state is None` means unfitted; a fitted stateless transform has
+`state == {}`). Configuration is normal constructor arguments.
 
 ```python
-from features import feature
-from pyfixest_regression import regress
+from features import feature, FeatureTransform
 
-@feature("winsorize_income", version="1")
-def winsorize_income(data):
-    out = data.copy()
-    lo, hi = out["income"].quantile([0.01, 0.99])
-    out["income"] = out["income"].clip(lo, hi)
-    return out
+@feature("winsorize", version="1")
+class Winsorize(FeatureTransform):
+    def __init__(self, col, q=0.01):
+        self.col, self.q = col, q
 
-regress("y ~ income", data=df, steps=["winsorize_income"])
+    def fit(self, train):                       # stateful -> learn from train
+        self.state = {"lo": float(train[self.col].quantile(self.q)),
+                      "hi": float(train[self.col].quantile(1 - self.q))}
+        return self
+
+    def _transform(self, df):
+        out = df.copy()
+        out[self.col] = out[self.col].clip(self.state["lo"], self.state["hi"])
+        return out
 ```
 
-The steps run in order before the fit, and their `name@version` tags are logged
-(the `steps` param) and folded into the run's content hash — so the data prep is
-part of the run's identity and **bumping a transform's version forces a re-log**.
-Two example transforms ship in the module: `standardize` and `add_squares`.
-`regress` imports `features.py` only when you pass `steps=`, so grab that file too
-if you want this.
+Fit a pipeline of steps and replay it later:
+
+```python
+from features import fit_steps, save_pipeline, load_pipeline, apply_states
+
+prepped, states, tags = fit_steps(
+    train_df,
+    [("winsorize", {"col": "income"}), ("log", {"columns": ["income"]}), "standardize"],
+)
+save_pipeline(states, "pipeline.json")
+# serving, in another process:
+new = apply_states(serve_df, load_pipeline("pipeline.json"))
+```
+
+`fit_steps` records each step's resolved `name@version(params)` tag; `apply_states`
+rehydrates each transform via `from_state` and refuses to run if a step's stored
+version no longer matches the registry. Three transforms ship: `standardize`,
+`log` (adds `<col>_log` columns; the suffix is a parameter), and `winsorize`.
+
+`regress` integrates the same registry: `regress(..., steps=["standardize",
+("log", {"columns": ["income"]})])` fits those steps on the data before the
+regression, and logs their `name@version` tags (the `steps` param, folded into the
+run hash) — so the data prep is part of the run's identity and **bumping a
+transform's version forces a re-log**. `regress` imports `features.py` only when
+you pass `steps=`, so grab that file too if you want this.
 
 ## Copying a template
 
