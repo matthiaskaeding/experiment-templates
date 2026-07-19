@@ -396,7 +396,7 @@ def regress(
     global_version: str = "0",
     key_coefs: str | list[str] | None = None,
     n_key_coefs: int = 5,
-    steps: list[str | tuple[str, dict]] | None = None,
+    steps: list[tuple[str, dict]] | None = None,
     dataset_version: str = "v1",
     **kwargs: Any,
 ) -> Any:
@@ -469,8 +469,9 @@ def regress(
 
     ``data`` is dataframe-agnostic: pandas, polars, or anything pyfixest accepts
     (via narwhals) works, and the fit receives it as given. ``steps`` (a list of
-    names -- or ``(name, params)`` pairs -- from the ``features`` registry, e.g.
-    ``steps=["standardize", ("log", {"columns": ["income"]})]``) fits and applies
+    ``(name, params)`` pairs from the ``features`` registry -- the params dict may
+    be empty -- e.g.
+    ``steps=[("standardize", {}), ("log", {"columns": ["income"]})]``) fits and applies
     those feature transformations to ``data``, in order, before fitting (via
     ``features.fit_steps``); steps run in pandas, so with a non-pandas frame the
     transformed data is passed on as pandas. The applied ``name@version`` tags are

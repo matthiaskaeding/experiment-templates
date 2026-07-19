@@ -54,7 +54,7 @@ def test_save_load_apply_round_trip(tmp_path):
         [
             ("winsorize", {"col": "income"}),
             ("log", {"columns": ["income"]}),
-            "standardize",
+            ("standardize", {}),
         ],
     )
 
@@ -126,7 +126,7 @@ def test_fit_steps_does_not_mutate_input():
         [
             ("winsorize", {"col": "income"}),
             ("log", {"columns": ["income"]}),
-            "standardize",
+            ("standardize", {}),
         ],
     )
 
@@ -135,7 +135,7 @@ def test_fit_steps_does_not_mutate_input():
 
 def test_apply_states_version_mismatch_raises():
     df = _frame()
-    _, states, _ = fit_steps(df, ["standardize"])
+    _, states, _ = fit_steps(df, [("standardize", {})])
     states[0]["version"] = "999"  # pretend the registered version moved on
 
     with pytest.raises(ValueError, match="version mismatch"):
@@ -214,8 +214,8 @@ def test_save_pipeline_non_json_params_raises(tmp_path):
 
 def test_step_order_matters():
     df = pd.DataFrame({"income": [1.0, 2.0, 3.0, 100.0]})  # an outlier for winsorize
-    steps_a = [("winsorize", {"col": "income", "q": 0.25}), "standardize"]
-    steps_b = ["standardize", ("winsorize", {"col": "income", "q": 0.25})]
+    steps_a = [("winsorize", {"col": "income", "q": 0.25}), ("standardize", {})]
+    steps_b = [("standardize", {}), ("winsorize", {"col": "income", "q": 0.25})]
 
     # clip-then-scale differs from scale-then-clip
     a, _, _ = fit_steps(df, steps_a)
@@ -226,7 +226,7 @@ def test_step_order_matters():
 
 def test_non_json_state_raises_type_error(tmp_path):
     df = pd.DataFrame({"x": [1.0, 2.0, 3.0]})
-    _, states, _ = fit_steps(df, ["_broken_series"])
+    _, states, _ = fit_steps(df, [("_broken_series", {})])
 
     with pytest.raises(TypeError, match="non-JSON-serializable"):
         save_pipeline(states, str(tmp_path / "pipeline.json"))
@@ -263,6 +263,6 @@ def test_tag_format_sorts_param_keys_and_shows_resolved_defaults():
     _, _, tags = fit_steps(df, [("winsorize", {"col": "income"})])
     assert tags == ["winsorize@1(col=income,q=0.01)"]
 
-    # a bare step with only None-valued params (columns=None -> "all") has no suffix
-    _, _, bare = fit_steps(df, ["standardize"])
+    # a step with only None-valued params (columns=None -> "all") has no suffix
+    _, _, bare = fit_steps(df, [("standardize", {})])
     assert bare == ["standardize@1"]

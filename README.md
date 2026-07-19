@@ -129,7 +129,7 @@ from features import fit_steps, save_pipeline, load_pipeline, apply_states
 
 prepped, states, tags = fit_steps(
     train_df,
-    [("winsorize", {"col": "income"}), ("log", {"columns": ["income"]}), "standardize"],
+    [("winsorize", {"col": "income"}), ("log", {"columns": ["income"]}), ("standardize", {})],
 )
 save_pipeline(states, "pipeline.json")
 # serving, in another process:
@@ -141,7 +141,7 @@ rehydrates each transform via `from_state` and refuses to run if a step's stored
 version no longer matches the registry. Three transforms ship: `standardize`,
 `log` (adds `<col>_log` columns; the suffix is a parameter), and `winsorize`.
 
-`regress` integrates the same registry: `regress(..., steps=["standardize",
+`regress` integrates the same registry: `regress(..., steps=[("standardize", {}),
 ("log", {"columns": ["income"]})])` fits those steps on the data before the
 regression, and logs their `name@version` tags (the `steps` param, folded into the
 run hash) — so the data prep is part of the run's identity and **bumping a

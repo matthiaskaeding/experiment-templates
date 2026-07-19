@@ -24,7 +24,7 @@ Train/serve workflow
 
     prepped, states, tags = fit_steps(
         train_df,
-        [("winsorize", {"col": "income"}), ("log", {"columns": ["income"]}), "standardize"],
+        [("winsorize", {"col": "income"}), ("log", {"columns": ["income"]}), ("standardize", {})],
     )
     booster = lgb.train(params, lgb.Dataset(prepped[features], prepped[target]))
     save_pipeline(states, "pipeline.json")
@@ -45,7 +45,7 @@ from dataclasses import dataclass
 import numpy as np
 import pandas as pd
 
-Step = str | tuple[str, dict]
+Step = tuple[str, dict]
 
 
 class FeatureTransform(ABC):
@@ -179,14 +179,6 @@ def registered_features() -> dict[str, str]:
 # --- Pipeline helpers --------------------------------------------------------
 
 
-def _normalize_step(step: Step) -> tuple[str, dict]:
-    """Normalize a step to ``(name, params)``. A bare ``"name"`` means no params."""
-    if isinstance(step, str):
-        return step, {}
-    name, params = step
-    return name, dict(params)
-
-
 def _tag(name: str, version: str, params: dict) -> str:
     """A compact ``"name@version"`` tag, with ``(k=v,...)`` (sorted keys) appended
     for the params that are set, e.g. ``"winsorize@1(col=income,q=0.01)"``. Params
@@ -205,10 +197,11 @@ def fit_steps(
 ) -> tuple[pd.DataFrame, list[dict], list[str]]:
     """Fit and apply a pipeline of steps to ``train``, in order.
 
-    Each step is a registered name (``"standardize"``) or a ``(name, params)`` pair
-    (``("log", {"columns": ["income"]})``). For each step the class is looked up,
-    instantiated as ``cls(**params)``, and ``fit_transform``-ed on the current
-    frame, carrying the result forward. The stored/tagged params are the transform's
+    Each step is a ``(name, params)`` pair of a registered name and its
+    constructor params -- e.g. ``("log", {"columns": ["income"]})``, or
+    ``("standardize", {})`` for a transform with no params. For each step the
+    class is looked up, instantiated as ``cls(**params)``, and
+    ``fit_transform``-ed on the current frame, carrying the result forward. The stored/tagged params are the transform's
     *resolved* ``.params`` (so defaults are captured too, e.g. ``winsorize``'s
     ``q=0.01``). Returns ``(transformed_train, states, tags)`` where ``states`` is a
     list of ``{"name", "version", "params", "state"}`` dicts (ready for
@@ -218,7 +211,7 @@ def fit_steps(
     states: list[dict] = []
     tags: list[str] = []
     for step in steps:
-        name, params = _normalize_step(step)
+        name, params = step
         feat = get_feature(name)
         obj = feat.cls(**params)
         current = obj.fit_transform(current)
@@ -247,7 +240,7 @@ def plan_steps(steps: list[Step]) -> list[str]:
     """
     tags: list[str] = []
     for step in steps:
-        name, params = _normalize_step(step)
+        name, params = step
         feat = get_feature(name)
         obj = feat.cls(**params)
         tags.append(_tag(name, feat.version, obj.params))
