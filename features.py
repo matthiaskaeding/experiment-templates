@@ -262,19 +262,21 @@ def save_pipeline(states: list[dict], path: str) -> None:
 
     Validates every entry first (so a bad entry never leaves a partial file):
     raises ``ValueError`` naming a step whose ``state`` is None (never fitted), and
-    ``TypeError`` naming a step whose ``state`` is not JSON-serializable.
+    ``TypeError`` naming a step whose ``params`` or ``state`` is not
+    JSON-serializable.
     """
     for entry in states:
         if entry["state"] is None:
             raise ValueError(
                 f"step {entry['name']!r} was never fitted (state is None); cannot save"
             )
-        try:
-            json.dumps(entry["state"])
-        except TypeError as exc:
-            raise TypeError(
-                f"step {entry['name']!r} has non-JSON-serializable state: {exc}"
-            ) from exc
+        for field in ("params", "state"):
+            try:
+                json.dumps(entry[field])
+            except TypeError as exc:
+                raise TypeError(
+                    f"step {entry['name']!r} has non-JSON-serializable {field}: {exc}"
+                ) from exc
     with open(path, "w") as fh:
         json.dump(states, fh, indent=2)
 
@@ -292,18 +294,31 @@ def load_pipeline(path: str) -> list[dict]:
 class Standardize(FeatureTransform):
     """Stateful: z-score columns using the training mean and standard deviation.
 
-    ``columns`` defaults to None, meaning every numeric column of ``train``.
-    Columns with zero standard deviation (constants) are scaled by 1 instead, so
-    the output is all-zero rather than NaN/inf.
+    ``columns`` defaults to None, meaning every numeric column of ``train`` (an
+    explicit empty list standardizes nothing). Columns with zero standard deviation
+    (constants) are scaled by 1 instead, so the output is all-zero rather than
+    NaN/inf. A column whose standard deviation is *undefined* (NaN -- e.g. a
+    single-row fit or an all-NaN column) raises, since that is almost certainly a
+    caller bug rather than something to paper over.
     """
 
     def __init__(self, columns: list[str] | None = None) -> None:
         self.columns = columns
 
     def fit(self, train: pd.DataFrame) -> Standardize:
-        cols = self.columns or list(train.select_dtypes("number").columns)
+        cols = (
+            self.columns
+            if self.columns is not None
+            else list(train.select_dtypes("number").columns)
+        )
         mu = train[cols].mean()
-        sd = train[cols].std().replace(0, 1.0)  # guard zero std
+        sd = train[cols].std().replace(0, 1.0)  # constants -> scale by 1 (output 0)
+        if sd.isna().any():
+            undefined = [c for c in cols if pd.isna(sd[c])]
+            raise ValueError(
+                f"Standardize: standard deviation is undefined for {undefined} "
+                f"(e.g. a single-row fit or an all-NaN column); cannot standardize."
+            )
         self.state = {
             "cols": cols,
             "mu": {c: float(mu[c]) for c in cols},
@@ -325,9 +340,11 @@ class Log(FeatureTransform):
 
     For each column ``c`` in ``columns``, adds a new column ``f"{c}{suffix}"``
     (``suffix`` defaults to ``"_log"``) holding the natural log of ``c``. Uses
-    ``np.log`` (not ``log1p``), so the columns must be strictly positive. Being
-    stateless, it implements only ``_transform``; ``fit`` (which records the empty
-    ``state == {}``), the fitted-guard, and serialization are all inherited.
+    ``np.log`` (not ``log1p``), so the columns must be strictly positive:
+    non-positive values raise a ``ValueError`` rather than silently emitting
+    ``-inf``/``NaN`` into the model. Being stateless, it implements only
+    ``_transform``; ``fit`` (which records the empty ``state == {}``), the
+    fitted-guard, and serialization are all inherited.
     """
 
     def __init__(self, columns: list[str], suffix: str = "_log") -> None:
@@ -337,7 +354,12 @@ class Log(FeatureTransform):
     def _transform(self, df: pd.DataFrame) -> pd.DataFrame:
         out = df.copy()
         for c in self.columns:
-            out[f"{c}{self.suffix}"] = np.log(out[c])
+            if (df[c] <= 0).any():
+                raise ValueError(
+                    f"log: column {c!r} has non-positive values, where the natural "
+                    f"log is undefined; clip/filter them first (e.g. winsorize)."
+                )
+            out[f"{c}{self.suffix}"] = np.log(df[c])
         return out
 
 

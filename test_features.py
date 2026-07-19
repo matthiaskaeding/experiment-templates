@@ -171,15 +171,55 @@ def test_constant_column_standardizes_to_zero():
     assert (out["c"] == 0.0).all()  # zero std guarded -> 0, not NaN/inf
 
 
-def test_step_order_matters():
-    df = pd.DataFrame({"x": [1.0, 2.0, 4.0]})  # strictly positive
+def test_standardize_empty_columns_standardizes_nothing():
+    # columns=[] must mean "no columns", not fall through to "all numeric" (the
+    # `or` truthiness bug); an explicit empty list is a real, honored choice.
+    df = pd.DataFrame({"a": [1.0, 2.0, 3.0], "b": [10.0, 20.0, 30.0]})
 
-    # log-then-standardize logs the raw (positive) x; standardize-then-log logs the
-    # centered x (which has negatives -> NaN), so the two pipelines differ. The
-    # NaN from log-of-negative is expected here, so silence that numpy warning.
-    a, _, _ = fit_steps(df, [("log", {"columns": ["x"]}), "standardize"])
-    with np.errstate(invalid="ignore"):
-        b, _, _ = fit_steps(df, ["standardize", ("log", {"columns": ["x"]})])
+    out = Standardize(columns=[]).fit(df).transform(df)
+
+    pd.testing.assert_frame_equal(out, df)
+
+
+def test_standardize_single_row_fit_raises():
+    # a single row has undefined (NaN) std; refuse rather than emit all-NaN
+    df = pd.DataFrame({"x": [5.0]})
+
+    with pytest.raises(ValueError, match="undefined"):
+        Standardize(columns=["x"]).fit(df)
+
+
+def test_log_non_positive_raises():
+    # np.log of 0/negative is -inf/NaN; fail loudly instead of leaking garbage
+    df = pd.DataFrame({"x": [1.0, 0.0, 3.0]})
+
+    with pytest.raises(ValueError, match="non-positive"):
+        Log(columns=["x"]).fit(df).transform(df)
+
+
+def test_save_pipeline_non_json_params_raises(tmp_path):
+    # params are validated too, not just state
+    states = [
+        {
+            "name": "winsorize",
+            "version": "1",
+            "params": {"col": "x", "q": np.int64(1)},  # numpy int -> not JSON
+            "state": {"lo": 0.0, "hi": 1.0},
+        }
+    ]
+
+    with pytest.raises(TypeError, match="non-JSON-serializable params"):
+        save_pipeline(states, str(tmp_path / "pipeline.json"))
+
+
+def test_step_order_matters():
+    df = pd.DataFrame({"income": [1.0, 2.0, 3.0, 100.0]})  # an outlier for winsorize
+    steps_a = [("winsorize", {"col": "income", "q": 0.25}), "standardize"]
+    steps_b = ["standardize", ("winsorize", {"col": "income", "q": 0.25})]
+
+    # clip-then-scale differs from scale-then-clip
+    a, _, _ = fit_steps(df, steps_a)
+    b, _, _ = fit_steps(df, steps_b)
 
     assert not a.equals(b)
 
