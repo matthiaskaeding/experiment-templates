@@ -154,13 +154,13 @@ def _call_model_fn(model_fn: Callable[..., Any], bound_args: dict[str, Any]) -> 
     return model_fn(*bound_args[var_positional], **keywords)
 
 
-def _apply_steps(bound_args: dict[str, Any], steps: list[Any]) -> None:
-    """Fit and apply the feature ``steps`` to ``bound_args["data"]`` in place."""
+def _apply_steps(data: Any, steps: list[Any]) -> pd.DataFrame:
+    """Fit and apply the feature ``steps`` to ``data``, returning the transformed
+    frame. Steps run in pandas, so a non-pandas frame comes back as pandas."""
     from features import fit_steps as _fit_steps
 
-    data_pd = _to_pandas(bound_args.get("data"))
-    transformed, _states, _tags = _fit_steps(data_pd, steps)
-    bound_args["data"] = transformed
+    transformed, _states, _tags = _fit_steps(_to_pandas(data), steps)
+    return transformed
 
 
 def _fit(
@@ -177,7 +177,7 @@ def _fit(
     is identical whether or not it is being logged.
     """
     if steps:
-        _apply_steps(bound_args, steps)
+        bound_args["data"] = _apply_steps(bound_args["data"], steps)
     fit = _call_model_fn(model_fn, bound_args)
     if isinstance(fit, FixestMulti):
         raise ValueError(_MULTI_MODEL_ERROR)
@@ -473,7 +473,7 @@ def regress(
     ``steps=["standardize", ("log", {"columns": ["income"]})]``) fits and applies
     those feature transformations to ``data``, in order, before fitting (via
     ``features.fit_steps``); steps run in pandas, so with a non-pandas frame the
-    transformed data is passed on as pandas. The applied ``name@version`` tags are
+    transformed data is passed on as pandas. The resolved ``name@version`` tags are
     logged as the ``steps`` param and folded into the hash, so the data preparation
     is part of the run's identity and bumping a transform's version forces a
     re-log. The ``features`` module is imported only when ``steps`` are given, so
@@ -506,13 +506,13 @@ def regress(
     # Feature steps: resolve the name@version tags now (validates that each
     # feature is registered and constructible) for the hash and params; the
     # data-dependent transform itself runs later, inside _fit.
-    applied_steps: list[str] = []
+    step_tags: list[str] = []
     if steps:
         if data_shape is None:
             raise TypeError("steps require `data` to be a dataframe")
         from features import plan_steps as _plan_steps
 
-        applied_steps = _plan_steps(steps)
+        step_tags = _plan_steps(steps)
 
     # A multi-model formula (csw()/sw() or several dependent variables) fans out
     # into one resolved model per spec; each is logged as its own run below.
@@ -534,7 +534,7 @@ def regress(
     # _fit) because here the fan-out into a FixestMulti is expected, not an error.
     if is_multi:
         if steps:
-            _apply_steps(bound_args, steps)
+            bound_args["data"] = _apply_steps(bound_args["data"], steps)
         return _log_multi(
             _call_model_fn(model_fn, bound_args),
             name=name,
@@ -547,15 +547,15 @@ def regress(
             dataset_version=dataset_version,
             key_coefs=key_coefs,
             n_key_coefs=n_key_coefs,
-            applied_steps=applied_steps,
+            step_tags=step_tags,
             has_explicit_experiment=has_explicit_experiment,
         )
 
     # --- 2. Decide (whether to log -- never whether or how to fit) -----------
     model_params = {k: v for k, v in bound_args.items() if k != "data"}
     model_params["model_fn"] = getattr(model_fn, "__name__", str(model_fn))
-    if applied_steps:
-        model_params["steps"] = applied_steps
+    if step_tags:
+        model_params["steps"] = step_tags
     experiment_hash = compute_experiment_hash(
         dataset_version, model_params, global_version
     )
@@ -584,8 +584,8 @@ def regress(
         if name is not None:
             mlflow.log_param("name", name)
         mlflow.log_param("dataset_version", dataset_version)
-        if applied_steps:
-            mlflow.log_param("steps", ",".join(applied_steps))
+        if step_tags:
+            mlflow.log_param("steps", ",".join(step_tags))
         mlflow.log_param("experiment_hash", experiment_hash)
         if fml is not None:
             mlflow.log_param("fml", fml)
@@ -633,7 +633,7 @@ def _log_multi(
     dataset_version: str,
     key_coefs: str | list[str] | None,
     n_key_coefs: int,
-    applied_steps: list[str],
+    step_tags: list[str],
     has_explicit_experiment: bool,
 ) -> list[Any]:
     """Log each model of a multi-model (csw/sw/multi-depvar) fit as its own run.
@@ -658,8 +658,8 @@ def _log_multi(
         params = {k: v for k, v in bound_args.items() if k != "data"}
         params["fml"] = resolved_fml
         params["model_fn"] = model_fn_name
-        if applied_steps:
-            params["steps"] = applied_steps
+        if step_tags:
+            params["steps"] = step_tags
         experiment_hash = compute_experiment_hash(
             dataset_version, params, global_version
         )
@@ -682,8 +682,8 @@ def _log_multi(
             if sub_name is not None:
                 mlflow.log_param("name", sub_name)
             mlflow.log_param("dataset_version", dataset_version)
-            if applied_steps:
-                mlflow.log_param("steps", ",".join(applied_steps))
+            if step_tags:
+                mlflow.log_param("steps", ",".join(step_tags))
             mlflow.log_param("experiment_hash", experiment_hash)
             mlflow.log_param("fml", resolved_fml)
             if original_fml is not None and original_fml != resolved_fml:
