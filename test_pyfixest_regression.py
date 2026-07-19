@@ -753,10 +753,9 @@ def test_regress_steps_are_part_of_the_hash(tmp_path):
     mlflow.set_tracking_uri(f"sqlite:///{tmp_path}/mlflow.db")
     data = pf.get_data()
 
-    # add_squares adds X1_sq but leaves the used columns (Y, X1, X2) untouched, so
-    # the two runs differ *only* by the steps tag -- proving steps enter the hash.
+    # same formula/data, but the steps tag differs -> two distinct runs
     regress("Y ~ X1 + X2", data=data, experiment_name="steps-id")
-    regress("Y ~ X1 + X2", data=data, steps=["add_squares"], experiment_name="steps-id")
+    regress("Y ~ X1 + X2", data=data, steps=["standardize"], experiment_name="steps-id")
 
     assert len(results_table("steps-id")) == 2
 

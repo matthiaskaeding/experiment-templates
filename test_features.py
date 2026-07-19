@@ -1,62 +1,214 @@
+import numpy as np
 import pandas as pd
 import pytest
 
-from features import apply_steps, feature, get_feature, registered_features
+from features import (
+    FeatureTransform,
+    Log,
+    Standardize,
+    apply_states,
+    feature,
+    fit_steps,
+    get_feature,
+    load_pipeline,
+    save_pipeline,
+)
 
 
-def test_builtin_features_are_registered():
-    reg = registered_features()
-    assert reg["standardize"] == "1"
-    assert reg["add_squares"] == "1"
+@feature("_broken_series", version="1")
+class _BrokenSeries(FeatureTransform):
+    """A deliberately broken transform: stores a non-JSON value (a Series)."""
+
+    def __init__(self, col: str = "x") -> None:
+        self.col = col
+
+    def fit(self, train):
+        self.state = {"s": train[self.col]}  # a pd.Series -> not JSON-serializable
+        return self
+
+    def _transform(self, df):
+        return df.copy()
 
 
-def test_standardize_zscores_numeric_columns():
-    df = pd.DataFrame({"a": [1.0, 2.0, 3.0], "b": [10.0, 20.0, 30.0]})
-
-    out, applied = apply_steps(df, ["standardize"])
-
-    assert applied == ["standardize@1"]
-    assert abs(out["a"].mean()) < 1e-9
-    assert abs(out["a"].std() - 1.0) < 1e-9
-    # the input frame is not mutated
-    assert df["a"].tolist() == [1.0, 2.0, 3.0]
+def _frame():
+    return pd.DataFrame(
+        {"income": [10.0, 20.0, 30.0, 1000.0], "age": [25.0, 40.0, 60.0, 80.0]}
+    )
 
 
-def test_add_squares_adds_squared_columns():
-    df = pd.DataFrame({"a": [1.0, 2.0, 3.0]})
+def test_from_state_round_trip():
+    train = _frame()
+    t = Standardize(columns=["income"]).fit(train)
 
-    out, applied = apply_steps(df, ["add_squares"])
+    # params is derived from the __init__ signature, so this reconstructs t exactly
+    rebuilt = type(t).from_state(t.state, **t.params)
 
-    assert applied == ["add_squares@1"]
-    assert out["a_sq"].tolist() == [1.0, 4.0, 9.0]
-
-
-def test_apply_steps_runs_in_order():
-    # add_squares first creates a_sq, then standardize z-scores it
-    df = pd.DataFrame({"a": [1.0, 2.0, 3.0, 4.0]})
-
-    out, applied = apply_steps(df, ["add_squares", "standardize"])
-
-    assert applied == ["add_squares@1", "standardize@1"]
-    assert "a_sq" in out.columns
-    assert abs(out["a_sq"].mean()) < 1e-9
+    assert t.params == {"columns": ["income"]}
+    pd.testing.assert_frame_equal(t.transform(train), rebuilt.transform(train))
 
 
-def test_unknown_feature_raises():
+def test_save_load_apply_round_trip(tmp_path):
+    df = _frame()
+    prepped, states, _ = fit_steps(
+        df,
+        [
+            ("winsorize", {"col": "income"}),
+            ("log", {"columns": ["income"]}),
+            "standardize",
+        ],
+    )
+
+    path = str(tmp_path / "pipeline.json")
+    save_pipeline(states, path)
+    loaded = load_pipeline(path)
+
+    pd.testing.assert_frame_equal(apply_states(df, loaded), prepped)
+
+
+def test_no_leakage_uses_train_statistics():
+    train = pd.DataFrame({"x": [0.0, 10.0]})
+    test = pd.DataFrame({"x": [5.0, 15.0]})
+
+    t = Standardize(columns=["x"]).fit(train)
+    out = t.transform(test)
+
+    mu = 5.0
+    sd = train["x"].std()  # sample std (ddof=1)
+    expected = (test["x"] - mu) / sd
+    assert np.allclose(out["x"].to_numpy(), expected.to_numpy())
+
+
+def test_transform_before_fit_raises_for_both():
+    df = _frame()
+    # the guard lives on the base class, inherited by both stateful and stateless
+    with pytest.raises(RuntimeError, match="before fit"):
+        Standardize(columns=["income"]).transform(df)
+    with pytest.raises(RuntimeError, match="before fit"):
+        Log(columns=["income"]).transform(df)
+
+
+def test_stateless_fitted_state_is_empty_dict(tmp_path):
+    df = pd.DataFrame({"x": [1.0, 2.0, 3.0]})
+
+    fitted = Log(columns=["x"]).fit(df)
+    assert fitted.state == {}  # fitted, not None
+
+    prepped, states, _ = fit_steps(df, [("log", {"columns": ["x"]})])
+    assert states[0]["state"] == {}
+
+    path = str(tmp_path / "pipeline.json")
+    save_pipeline(states, path)
+    out = apply_states(df, load_pipeline(path))
+    pd.testing.assert_frame_equal(out, prepped)
+
+
+def test_save_pipeline_none_vs_empty_state(tmp_path):
+    path = str(tmp_path / "pipeline.json")
+
+    # state None (never fitted) -> refuse to save
+    unfitted = [{"name": "standardize", "version": "1", "params": {}, "state": None}]
+    with pytest.raises(ValueError, match="never fitted"):
+        save_pipeline(unfitted, path)
+
+    # state {} (fitted, stateless) -> fine
+    fitted = [
+        {"name": "log", "version": "1", "params": {"columns": ["x"]}, "state": {}}
+    ]
+    save_pipeline(fitted, path)  # does not raise
+
+
+def test_fit_steps_does_not_mutate_input():
+    df = _frame()
+    before = df.copy()
+
+    fit_steps(
+        df,
+        [
+            ("winsorize", {"col": "income"}),
+            ("log", {"columns": ["income"]}),
+            "standardize",
+        ],
+    )
+
+    pd.testing.assert_frame_equal(df, before)
+
+
+def test_apply_states_version_mismatch_raises():
+    df = _frame()
+    _, states, _ = fit_steps(df, ["standardize"])
+    states[0]["version"] = "999"  # pretend the registered version moved on
+
+    with pytest.raises(ValueError, match="version mismatch"):
+        apply_states(df, states)
+
+
+def test_registry_errors():
+    # duplicate name
+    with pytest.raises(ValueError, match="already registered"):
+
+        @feature("standardize", version="1")
+        class _Dup(FeatureTransform):
+            def _transform(self, df):
+                return df
+
+    # unknown name
     with pytest.raises(KeyError, match="unknown feature"):
         get_feature("definitely_not_registered")
 
-    with pytest.raises(KeyError):
-        apply_steps(pd.DataFrame({"a": [1]}), ["definitely_not_registered"])
+    # decorating a non-FeatureTransform
+    with pytest.raises(TypeError, match="FeatureTransform"):
+
+        @feature("_not_a_transform", version="1")
+        class _NotATransform:
+            pass
 
 
-def test_duplicate_registration_raises():
-    @feature("dup_feature_for_test", version="1")
-    def _first(data):
-        return data
+def test_constant_column_standardizes_to_zero():
+    df = pd.DataFrame({"c": [5.0, 5.0, 5.0]})
 
-    with pytest.raises(ValueError, match="already registered"):
+    out = Standardize(columns=["c"]).fit(df).transform(df)
 
-        @feature("dup_feature_for_test", version="2")
-        def _second(data):
-            return data
+    assert (out["c"] == 0.0).all()  # zero std guarded -> 0, not NaN/inf
+
+
+def test_step_order_matters():
+    df = pd.DataFrame({"x": [1.0, 2.0, 4.0]})  # strictly positive
+
+    # log-then-standardize logs the raw (positive) x; standardize-then-log logs the
+    # centered x (which has negatives -> NaN), so the two pipelines differ. The
+    # NaN from log-of-negative is expected here, so silence that numpy warning.
+    a, _, _ = fit_steps(df, [("log", {"columns": ["x"]}), "standardize"])
+    with np.errstate(invalid="ignore"):
+        b, _, _ = fit_steps(df, ["standardize", ("log", {"columns": ["x"]})])
+
+    assert not a.equals(b)
+
+
+def test_non_json_state_raises_type_error(tmp_path):
+    df = pd.DataFrame({"x": [1.0, 2.0, 3.0]})
+    _, states, _ = fit_steps(df, ["_broken_series"])
+
+    with pytest.raises(TypeError, match="non-JSON-serializable"):
+        save_pipeline(states, str(tmp_path / "pipeline.json"))
+
+
+def test_fit_transform_equals_fit_then_transform():
+    df = _frame()
+
+    a = Standardize().fit_transform(df)
+    b = Standardize().fit(df).transform(df)
+
+    pd.testing.assert_frame_equal(a, b)
+
+
+def test_tag_format_sorts_param_keys_and_shows_resolved_defaults():
+    df = pd.DataFrame({"income": [10.0, 20.0, 30.0]})
+
+    # q is left to its default; the tag still shows it (params is resolved from the
+    # instance), with keys sorted
+    _, _, tags = fit_steps(df, [("winsorize", {"col": "income"})])
+    assert tags == ["winsorize@1(col=income,q=0.01)"]
+
+    # a bare step with only None-valued params (columns=None -> "all") has no suffix
+    _, _, bare = fit_steps(df, ["standardize"])
+    assert bare == ["standardize@1"]
