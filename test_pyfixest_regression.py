@@ -1,6 +1,7 @@
 import warnings
 
 import mlflow
+import pandas as pd
 import pyfixest as pf
 import pytest
 from mlflow.entities import ViewType
@@ -356,189 +357,90 @@ def test_regress_dispatches_on_fit_type_not_function_identity(tmp_path):
 
 
 def test_same_inputs_give_same_hash():
-    data = pf.get_data()
-    params = {"fml": "Y ~ X1 + X2", "vcov": "iid"}
+    params = {"fml": "Y ~ X1 + X2", "vcov": "iid", "model_fn": "feols"}
 
-    h1 = compute_experiment_hash(data, params, global_version="v1")
-    h2 = compute_experiment_hash(data.copy(), dict(params), global_version="v1")
+    h1 = compute_experiment_hash("v1", params, global_version="0")
+    h2 = compute_experiment_hash("v1", dict(params), global_version="0")
 
     assert h1 == h2
 
 
-def test_changed_data_changes_hash():
-    data = pf.get_data()
-    params = {"fml": "Y ~ X1 + X2", "vcov": "iid"}
+def test_changed_dataset_version_changes_hash():
+    params = {"fml": "Y ~ X1 + X2", "model_fn": "feols"}
 
-    h1 = compute_experiment_hash(data, params, global_version="v1")
-    changed = data.copy()
-    changed["X1"] = changed["X1"] + 1
-    h2 = compute_experiment_hash(changed, params, global_version="v1")
+    h1 = compute_experiment_hash("v1", params, global_version="0")
+    h2 = compute_experiment_hash("v2", params, global_version="0")
 
     assert h1 != h2
 
 
-def test_changed_model_params_changes_hash():
-    data = pf.get_data()
+def test_data_is_not_hashed():
+    # The data itself is not part of the hash -- identity is (dataset_version,
+    # model params, global_version). Same version + params => same hash even if
+    # you (wrongly) claim a changed dataset is still "v1".
+    params = {"fml": "Y ~ X1 + X2", "model_fn": "feols"}
 
+    assert compute_experiment_hash(
+        "v1", params, global_version="0"
+    ) == compute_experiment_hash("v1", dict(params), global_version="0")
+
+
+def test_changed_model_params_changes_hash():
     h1 = compute_experiment_hash(
-        data, {"fml": "Y ~ X1 + X2", "vcov": "iid"}, global_version="v1"
+        "v1", {"fml": "Y ~ X1 + X2", "vcov": "iid"}, global_version="0"
     )
     h2 = compute_experiment_hash(
-        data, {"fml": "Y ~ X1", "vcov": "iid"}, global_version="v1"
+        "v1", {"fml": "Y ~ X1", "vcov": "iid"}, global_version="0"
     )
 
     assert h1 != h2
 
 
 def test_changed_model_fn_changes_hash():
-    # The modeling function participates in the hash, so the same data + formula
-    # under different estimators must not collide (previously they did).
-    data = pf.get_data()
+    # The modeling function participates in the hash, so the same formula under
+    # different estimators must not collide.
     base = {"fml": "Y ~ X1 + X2", "vcov": "iid"}
 
     h_feols = compute_experiment_hash(
-        data, {**base, "model_fn": "feols"}, global_version="v1"
+        "v1", {**base, "model_fn": "feols"}, global_version="0"
     )
     h_quantreg = compute_experiment_hash(
-        data, {**base, "model_fn": "quantreg"}, global_version="v1"
+        "v1", {**base, "model_fn": "quantreg"}, global_version="0"
     )
 
     assert h_feols != h_quantreg
 
 
-def test_changed_global_version_changes_hash():
-    data = pf.get_data()
-    params = {"fml": "Y ~ X1 + X2", "vcov": "iid"}
+def test_steps_change_the_hash():
+    # applied feature steps are part of model_params, so they change the hash
+    base = {"fml": "Y ~ X1", "model_fn": "feols"}
 
-    h1 = compute_experiment_hash(data, params, global_version="v1")
-    h2 = compute_experiment_hash(data, params, global_version="v2")
+    h_none = compute_experiment_hash("v1", dict(base), global_version="0")
+    h_steps = compute_experiment_hash(
+        "v1", {**base, "steps": ["standardize@1"]}, global_version="0"
+    )
+
+    assert h_none != h_steps
+
+
+def test_changed_global_version_changes_hash():
+    params = {"fml": "Y ~ X1 + X2", "model_fn": "feols"}
+
+    h1 = compute_experiment_hash("v1", params, global_version="0")
+    h2 = compute_experiment_hash("v1", params, global_version="1")
 
     assert h1 != h2
 
 
 def test_model_params_key_order_does_not_change_hash():
-    data = pf.get_data()
-
     h1 = compute_experiment_hash(
-        data, {"fml": "Y ~ X1 + X2", "vcov": "iid"}, global_version="v1"
+        "v1", {"fml": "Y ~ X1 + X2", "vcov": "iid"}, global_version="0"
     )
     h2 = compute_experiment_hash(
-        data, {"vcov": "iid", "fml": "Y ~ X1 + X2"}, global_version="v1"
+        "v1", {"vcov": "iid", "fml": "Y ~ X1 + X2"}, global_version="0"
     )
 
     assert h1 == h2
-
-
-def test_unused_column_does_not_change_hash():
-    # Only the columns the model reads are hashed, so touching a column the
-    # formula never mentions must not change the hash.
-    data = pf.get_data()
-    params = {"fml": "Y ~ X1 + X2", "model_fn": "feols"}
-
-    h1 = compute_experiment_hash(data, params, global_version="v1")
-    changed = data.copy()
-    changed["f3"] = changed["f3"] + 1  # f3 is not in the formula
-    h2 = compute_experiment_hash(changed, params, global_version="v1")
-
-    assert h1 == h2
-
-
-def test_dropping_unused_column_does_not_change_hash():
-    data = pf.get_data()
-    params = {"fml": "Y ~ X1 + X2", "model_fn": "feols"}
-
-    h1 = compute_experiment_hash(data, params, global_version="v1")
-    h2 = compute_experiment_hash(data.drop(columns=["f3"]), params, global_version="v1")
-
-    assert h1 == h2
-
-
-def test_frame_column_order_does_not_change_hash():
-    # Used columns are hashed in sorted order, so reordering the frame's columns
-    # leaves the hash unchanged.
-    data = pf.get_data()
-    params = {"fml": "Y ~ X1 + X2", "model_fn": "feols"}
-
-    h1 = compute_experiment_hash(data, params, global_version="v1")
-    h2 = compute_experiment_hash(data[data.columns[::-1]], params, global_version="v1")
-
-    assert h1 == h2
-
-
-def test_fixed_effect_column_is_part_of_hash():
-    # Variables after `|` (fixed effects) are used columns.
-    data = pf.get_data()
-    params = {"fml": "Y ~ X1 | f1", "model_fn": "feols"}
-
-    h1 = compute_experiment_hash(data, params, global_version="v1")
-    changed = data.copy()
-    changed["f1"] = changed["f1"] + 1
-    h2 = compute_experiment_hash(changed, params, global_version="v1")
-
-    assert h1 != h2
-
-
-def test_iv_instrument_column_is_part_of_hash():
-    # Instruments after the IV `~` are used columns.
-    data = pf.get_data()
-    params = {"fml": "Y ~ X2 | X1 ~ Z1", "model_fn": "feols"}
-
-    h1 = compute_experiment_hash(data, params, global_version="v1")
-    changed = data.copy()
-    changed["Z1"] = changed["Z1"] + 1
-    h2 = compute_experiment_hash(changed, params, global_version="v1")
-
-    assert h1 != h2
-
-
-def test_cluster_column_is_part_of_hash_only_when_clustered():
-    # A cluster column named in a vcov dict is a used column; the same column is
-    # ignored when vcov does not reference it.
-    data = pf.get_data()
-    changed = data.copy()
-    changed["group_id"] = changed["group_id"] + 1
-
-    clustered = {"fml": "Y ~ X1", "vcov": {"CRV1": "group_id"}, "model_fn": "feols"}
-    assert compute_experiment_hash(
-        data, clustered, global_version="v1"
-    ) != compute_experiment_hash(changed, clustered, global_version="v1")
-
-    plain = {"fml": "Y ~ X1", "vcov": "hetero", "model_fn": "feols"}
-    assert compute_experiment_hash(
-        data, plain, global_version="v1"
-    ) == compute_experiment_hash(changed, plain, global_version="v1")
-
-
-def test_weights_column_is_part_of_hash_only_when_weighted():
-    data = pf.get_data()
-    changed = data.copy()
-    changed["weights"] = changed["weights"] * 2
-
-    weighted = {"fml": "Y ~ X1", "weights": "weights", "model_fn": "feols"}
-    assert compute_experiment_hash(
-        data, weighted, global_version="v1"
-    ) != compute_experiment_hash(changed, weighted, global_version="v1")
-
-    unweighted = {"fml": "Y ~ X1", "model_fn": "feols"}
-    assert compute_experiment_hash(
-        data, unweighted, global_version="v1"
-    ) == compute_experiment_hash(changed, unweighted, global_version="v1")
-
-
-def test_unextractable_columns_fall_back_to_full_frame_hash():
-    # If the used columns can't be determined, hashing falls back to the whole
-    # frame -- so even an "unrelated" column change then affects the hash. A
-    # formula that parses to multiple models is not a single-model spec, so
-    # extraction bails and the conservative full-frame hash is used.
-    data = pf.get_data()
-    params = {"fml": "Y + Y2 ~ X1", "model_fn": "feols"}
-
-    h1 = compute_experiment_hash(data, params, global_version="v1")
-    changed = data.copy()
-    changed["f3"] = changed["f3"] + 1
-    h2 = compute_experiment_hash(changed, params, global_version="v1")
-
-    assert h1 != h2
 
 
 # --- dedup wiring ---
@@ -603,6 +505,53 @@ def test_regress_different_model_fn_is_not_a_duplicate(tmp_path):
     assert len(mlflow.search_runs(experiment_names=["model-fn-dedup"])) == 2
 
 
+def test_regress_logs_dataset_version(tmp_path):
+    mlflow.set_tracking_uri(f"sqlite:///{tmp_path}/mlflow.db")
+
+    regress("Y ~ X1", data=pf.get_data(), experiment_name="dv-log")
+
+    # default dataset_version is "v1"
+    assert mlflow.last_active_run().data.params["dataset_version"] == "v1"
+
+
+def test_regress_different_dataset_version_is_not_a_duplicate(tmp_path):
+    mlflow.set_tracking_uri(f"sqlite:///{tmp_path}/mlflow.db")
+    data = pf.get_data()
+
+    regress("Y ~ X1 + X2", data=data, dataset_version="v1", experiment_name="dv")
+    regress("Y ~ X1 + X2", data=data, dataset_version="v2", experiment_name="dv")
+
+    assert len(mlflow.search_runs(experiment_names=["dv"])) == 2
+
+
+def test_regress_changed_data_same_version_dedups(tmp_path):
+    # the data is not hashed: same dataset_version + params dedups even if the
+    # underlying values changed -- you assert data identity via dataset_version
+    mlflow.set_tracking_uri(f"sqlite:///{tmp_path}/mlflow.db")
+    data = pf.get_data()
+
+    regress("Y ~ X1 + X2", data=data, experiment_name="dv-data")
+    changed = data.copy()
+    changed["X1"] = changed["X1"] + 100.0
+    regress("Y ~ X1 + X2", data=changed, experiment_name="dv-data")
+
+    assert len(mlflow.search_runs(experiment_names=["dv-data"])) == 1
+
+
+def test_regress_accepts_polars_input(tmp_path):
+    import polars as pl
+
+    mlflow.set_tracking_uri(f"sqlite:///{tmp_path}/mlflow.db")
+    data = pl.from_pandas(pf.get_data())
+
+    fit = regress("Y ~ X1 + X2", data=data, experiment_name="polars-in")
+
+    assert fit._r2 is not None
+    run = mlflow.last_active_run()
+    assert run.data.params["fml"] == "Y ~ X1 + X2"
+    assert "data_shape" in run.data.params  # shape read via narwhals
+
+
 # --- results_table ---
 
 
@@ -632,7 +581,7 @@ def test_results_table_reads_active_experiment_by_default(tmp_path):
     mlflow.set_experiment("active-default")
     regress("Y ~ X1 + X2", data=pf.get_data())
 
-    table = results_table()
+    table = results_table(backend="pandas")
 
     assert len(table) == 1
     assert table["fml"].iloc[0] == "Y ~ X1 + X2"
@@ -642,9 +591,19 @@ def test_results_table_empty_experiment_returns_empty(tmp_path):
     mlflow.set_tracking_uri(f"sqlite:///{tmp_path}/mlflow.db")
     mlflow.create_experiment("no-runs")
 
-    table = results_table("no-runs")
+    table = results_table("no-runs", backend="pandas")
 
     assert table.empty
+
+
+def test_results_table_defaults_to_polars(tmp_path):
+    import polars as pl
+
+    mlflow.set_tracking_uri(f"sqlite:///{tmp_path}/mlflow.db")
+    regress("Y ~ X1", data=pf.get_data(), experiment_name="rt-pl")
+
+    assert isinstance(results_table("rt-pl"), pl.DataFrame)
+    assert isinstance(results_table("rt-pl", backend="pandas"), pd.DataFrame)
 
 
 def test_results_table_filter_string_by_name_and_metric(tmp_path):
@@ -774,7 +733,7 @@ def test_coeftable_empty_experiment_returns_empty(tmp_path):
     mlflow.set_tracking_uri(f"sqlite:///{tmp_path}/mlflow.db")
     mlflow.create_experiment("ct-empty")
 
-    assert coeftable("ct-empty").empty
+    assert coeftable("ct-empty", backend="pandas").empty
 
 
 # --- feature steps ---
@@ -813,7 +772,7 @@ def test_regress_same_steps_dedup(tmp_path):
 
 
 def test_regress_steps_require_a_dataframe():
-    with pytest.raises(TypeError, match="DataFrame"):
+    with pytest.raises(TypeError, match="dataframe"):
         regress("Y ~ X1", data=None, steps=["standardize"])
 
 
@@ -992,7 +951,7 @@ def test_etable_builds_cross_run_table_from_logged_info(tmp_path):
     )
     regress("Y ~ X1 + X2 | f1", data=data, name="fe", experiment_name="xrun")
 
-    table = etable("xrun")
+    table = etable("xrun", backend="pandas")
 
     # columns are headed by each run's name
     assert list(table.columns) == ["iid", "hetero", "fe"]
@@ -1017,7 +976,7 @@ def test_etable_columns_fall_back_to_abbreviated_formula(tmp_path):
     regress("Y ~ X1", data=data, vcov="hetero", experiment_name="lab")
     regress("Y ~ X1 + X2", data=data, experiment_name="lab")
 
-    table = etable("lab")
+    table = etable("lab", backend="pandas")
 
     assert list(table.columns) == ["X1", "X1 (2)", "X1 + X2"]
 
@@ -1040,11 +999,11 @@ def test_etable_filters_coefficients_and_handles_empty(tmp_path):
     data = pf.get_data()
 
     regress("Y ~ X1 + X2", data=data, experiment_name="xrun-filter")
-    only_x1 = etable("xrun-filter", coefficients="X1")
+    only_x1 = etable("xrun-filter", coefficients="X1", backend="pandas")
     assert "X1" in only_x1.index and "X2" not in only_x1.index
 
     mlflow.create_experiment("xrun-empty")
-    assert etable("xrun-empty").empty
+    assert etable("xrun-empty", backend="pandas").empty
     assert etable("xrun-empty", type="md") == ""
 
     with pytest.raises(ValueError, match="'df' or 'md'"):
@@ -1056,7 +1015,7 @@ def test_etable_drops_coefficients(tmp_path):
     data = pf.get_data()
 
     regress("Y ~ X1 + X2", data=data, experiment_name="xrun-drop")
-    table = etable("xrun-drop", drop="Intercept")
+    table = etable("xrun-drop", drop="Intercept", backend="pandas")
 
     assert "Intercept" not in table.index
     assert "X1" in table.index and "X2" in table.index
@@ -1070,7 +1029,22 @@ def test_etable_filter_string_selects_run_columns(tmp_path):
     regress("Y ~ X1 + X2", data=data, vcov="hetero", experiment_name="xrun-fs")
 
     # both runs -> two columns; filtering to one run -> a single column
-    assert etable("xrun-fs").shape[1] == 2
-    one = etable("xrun-fs", filter_string="params.vcov = 'hetero'")
+    assert etable("xrun-fs", backend="pandas").shape[1] == 2
+    one = etable("xrun-fs", filter_string="params.vcov = 'hetero'", backend="pandas")
     assert one.shape[1] == 1
     assert (one.loc["vcov"] == "hetero").all()
+
+
+def test_etable_polars_output_has_term_column(tmp_path):
+    import polars as pl
+
+    mlflow.set_tracking_uri(f"sqlite:///{tmp_path}/mlflow.db")
+    regress("Y ~ X1", data=pf.get_data(), name="m", experiment_name="et-pl")
+
+    table = etable("et-pl")  # default backend is polars
+
+    assert isinstance(table, pl.DataFrame)
+    # polars has no row index, so the coefficient/stat labels become a `term` column
+    assert table.columns[0] == "term"
+    assert "m" in table.columns
+    assert "X1" in table["term"].to_list()

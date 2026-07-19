@@ -100,6 +100,54 @@ def _bind_args(
     return bound.arguments
 
 
+def _to_pandas(data: Any) -> pd.DataFrame | None:
+    """A pandas view of any supported dataframe (pandas, polars, ...), or None.
+
+    pyfixest is dataframe-agnostic (via narwhals), so a fit can be handed a polars
+    frame directly. The parts of a run that need pandas -- content hashing,
+    ``data_shape``, feature steps -- go through this instead, so those keep working
+    regardless of the input backend (and a polars frame hashes the same as the
+    equivalent pandas one). Returns None when ``data`` is not a dataframe at all.
+    """
+    if isinstance(data, pd.DataFrame):
+        return data
+    try:
+        import narwhals as nw
+
+        return nw.from_native(data, eager_only=True).to_pandas()
+    except TypeError:
+        return None
+
+
+def _data_shape(data: Any) -> tuple[int, int] | None:
+    """The ``(rows, cols)`` shape of any supported dataframe, or None if ``data``
+    is not a dataframe. Uses narwhals so it works without converting to pandas."""
+    if isinstance(data, pd.DataFrame):
+        return data.shape
+    try:
+        import narwhals as nw
+
+        return nw.from_native(data, eager_only=True).shape
+    except TypeError:
+        return None
+
+
+def _to_backend(frame: pd.DataFrame, backend: str) -> Any:
+    """Return ``frame`` (built internally as pandas) in the requested backend.
+
+    ``"pandas"`` returns it unchanged; ``"polars"`` converts to a
+    ``polars.DataFrame`` (polars has no row index, so any pandas index should be
+    materialized as a column by the caller first).
+    """
+    if backend == "pandas":
+        return frame
+    if backend == "polars":
+        import polars as pl
+
+        return pl.from_pandas(frame)
+    raise ValueError(f"backend must be 'pandas' or 'polars', got {backend!r}")
+
+
 # pyfixest's tidy() uses display-style labels (``Estimate``, ``Std. Error``,
 # ``Pr(>|t|)``, ``2.5%`` ...). Log them under plain snake_case names that read
 # like a normal DataFrame, and in a presentation order that leads with the
@@ -265,6 +313,7 @@ def regress(
     key_coefs: str | list[str] | None = None,
     n_key_coefs: int = 5,
     steps: list[str] | None = None,
+    dataset_version: str = "v1",
     **kwargs: Any,
 ) -> Any:
     """Call a pyfixest modeling function inside a tracked MLflow run.
@@ -332,27 +381,30 @@ def regress(
     -- and the complete coefficient table always remains in the
     ``coefficients.json`` artifact.
 
-    ``steps`` (a list of names from the ``features`` registry) applies those
-    feature transformations to ``data``, in order, before fitting -- e.g.
-    ``steps=["standardize"]``. The applied ``name@version`` tags are logged as the
-    ``steps`` param and folded into the hash, so the data preparation is part of
-    the run's identity and bumping a transform's version forces a re-log. The
-    ``features`` module is imported only when ``steps`` are given, so the template
-    still works as a single file otherwise.
+    ``data`` is dataframe-agnostic: pandas, polars, or anything pyfixest accepts
+    (via narwhals) works, and the fit receives it as given. ``steps`` (a list of
+    names from the ``features`` registry) applies those feature transformations to
+    ``data``, in order, before fitting -- e.g. ``steps=["standardize"]``; steps run
+    in pandas, so with a non-pandas frame the transformed data is passed on as
+    pandas. The applied ``name@version`` tags are logged as the ``steps`` param and
+    folded into the hash, so the data preparation is part of the run's identity and
+    bumping a transform's version forces a re-log. The ``features`` module is
+    imported only when ``steps`` are given, so the template still works as a single
+    file otherwise.
 
-    Deduplication: when ``data`` is a DataFrame, a content hash of (data, model
-    params including ``model_fn``, ``global_version``) is computed via
-    ``compute_experiment_hash`` and logged as the ``experiment_hash`` param. Only
-    the columns the model actually reads are hashed -- the formula variables plus
-    any cluster/weight/offset/split columns -- so adding or changing unrelated
-    columns in ``data`` does not create a spurious new run. Before logging, the
-    active experiment is checked for a run with that same hash; if one exists, this
-    call skips logging entirely (no duplicate run is created). The model is *always*
-    re-fitted and returned either way -- only the MLflow logging is skipped -- since
-    MLflow stores metrics/artifacts, not the live fit object. Note that logging
-    configuration (``key_coefs`` / ``n_key_coefs``) is not part of the hash: an
-    experiment already logged with different key coefficients will still be skipped
-    as a duplicate; bump ``global_version`` to force a re-log.
+    Deduplication: a hash of (``dataset_version``, model params including
+    ``model_fn`` and any ``steps``, ``global_version``) is computed via
+    ``compute_experiment_hash`` and logged as the ``experiment_hash`` param. The
+    data itself is *not* hashed -- you assert which version of the data a run used
+    with ``dataset_version`` (default ``"v1"``), so bump it whenever the underlying
+    data changes. Before logging, the active experiment is checked for a run with
+    that same hash; if one exists, this call skips logging entirely (no duplicate
+    run is created). The model is *always* re-fitted and returned either way -- only
+    the MLflow logging is skipped -- since MLflow stores metrics/artifacts, not the
+    live fit object. Note that logging configuration (``key_coefs`` /
+    ``n_key_coefs``) is not part of the hash: an experiment already logged with
+    different key coefficients will still be skipped as a duplicate; bump
+    ``global_version`` (or ``dataset_version``) to force a re-log.
     """
     model_fn = _resolve_model_fn(model_fn)
 
@@ -363,23 +415,26 @@ def regress(
     data = bound_args.get("data")
     vcov = bound_args.get("vcov")
 
-    # Feature steps: apply the named transforms (from the features registry) to
-    # the data before fitting, and substitute the transformed frame back into the
-    # call so the fit sees it. The applied name@version tags become part of the
-    # run's identity (logged and hashed), so a version bump forces a re-log.
+    # Feature steps run in pandas: convert the (dataframe-agnostic) input, apply
+    # the named transforms, and substitute the transformed frame back into the call
+    # so the fit sees it. The applied name@version tags become part of the run's
+    # identity (logged and hashed), so a version bump forces a re-log.
     applied_steps: list[str] = []
     if steps:
-        if not isinstance(data, pd.DataFrame):
-            raise TypeError("steps require `data` to be a pandas DataFrame")
+        data_pd = _to_pandas(data)
+        if data_pd is None:
+            raise TypeError("steps require `data` to be a dataframe")
         from features import apply_steps as _apply_steps
 
-        data, applied_steps = _apply_steps(data, steps)
+        data, applied_steps = _apply_steps(data_pd, steps)
         bound_args["data"] = data
         if "data" in kwargs:
             kwargs = {**kwargs, "data": data}
         else:
             idx = list(inspect.signature(model_fn).parameters).index("data")
             args = tuple(data if i == idx else a for i, a in enumerate(args))
+
+    data_shape = _data_shape(data)
 
     # A multi-model formula (csw()/sw() or several dependent variables) fans out
     # into one resolved model per spec; each is logged as its own run below.
@@ -403,25 +458,26 @@ def regress(
             tags=tags,
             model_fn_name=getattr(model_fn, "__name__", str(model_fn)),
             bound_args=bound_args,
-            data=data,
+            data_shape=data_shape,
             vcov=vcov,
             global_version=global_version,
+            dataset_version=dataset_version,
             key_coefs=key_coefs,
             n_key_coefs=n_key_coefs,
             applied_steps=applied_steps,
             has_explicit_experiment=has_explicit_experiment,
         )
 
-    experiment_hash = None
-    if isinstance(data, pd.DataFrame):
-        model_params = {k: v for k, v in bound_args.items() if k != "data"}
-        model_params["model_fn"] = getattr(model_fn, "__name__", str(model_fn))
-        if applied_steps:
-            model_params["steps"] = applied_steps
-        experiment_hash = compute_experiment_hash(data, model_params, global_version)
+    model_params = {k: v for k, v in bound_args.items() if k != "data"}
+    model_params["model_fn"] = getattr(model_fn, "__name__", str(model_fn))
+    if applied_steps:
+        model_params["steps"] = applied_steps
+    experiment_hash = compute_experiment_hash(
+        dataset_version, model_params, global_version
+    )
 
     # Dedup hit: skip all logging (no new run), but still fit and return the model.
-    if experiment_hash is not None and _already_logged(experiment_hash):
+    if _already_logged(experiment_hash):
         fit = model_fn(*args, **kwargs)
         if isinstance(fit, FixestMulti):
             raise ValueError(_MULTI_MODEL_ERROR)
@@ -444,14 +500,14 @@ def regress(
         # from a random one; the param is present only when the user named the run).
         if name is not None:
             mlflow.log_param("name", name)
+        mlflow.log_param("dataset_version", dataset_version)
         if applied_steps:
             mlflow.log_param("steps", ",".join(applied_steps))
-        if experiment_hash is not None:
-            mlflow.log_param("experiment_hash", experiment_hash)
+        mlflow.log_param("experiment_hash", experiment_hash)
         if fml is not None:
             mlflow.log_param("fml", fml)
-        if isinstance(data, pd.DataFrame):
-            mlflow.log_param("data_shape", str(data.shape))
+        if data_shape is not None:
+            mlflow.log_param("data_shape", str(data_shape))
         if vcov is not None:
             mlflow.log_param("vcov", str(vcov))
 
@@ -493,9 +549,10 @@ def _log_multi(
     tags: dict[str, str] | None,
     model_fn_name: str,
     bound_args: dict[str, Any],
-    data: Any,
+    data_shape: tuple[int, int] | None,
     vcov: Any,
     global_version: str,
+    dataset_version: str,
     key_coefs: str | list[str] | None,
     n_key_coefs: int,
     applied_steps: list[str],
@@ -508,10 +565,11 @@ def _log_multi(
     and summary.md. Each run records the resolved ``fml`` plus ``fml_original``
     (the formula as written, e.g. ``Y ~ csw(X1, X2)``) so a sweep can be grouped
     back together (``results_table`` filtered on ``fml_original``). Deduplication
-    is per resolved model -- the hash is over the resolved formula -- so re-running
-    the sweep is a no-op, and a model already fitted standalone is not logged
-    twice. Returns the list of fitted models. (``estimation_time`` is not logged
-    here: the models are fitted together, so there is no per-model time.)
+    is per resolved model -- the hash is over the resolved formula and
+    ``dataset_version`` -- so re-running the sweep is a no-op, and a model already
+    fitted standalone is not logged twice. Returns the list of fitted models.
+    (``estimation_time`` is not logged here: the models are fitted together, so
+    there is no per-model time.)
     """
     original_fml = bound_args.get("fml")
     results = []
@@ -519,16 +577,16 @@ def _log_multi(
     for sub in fits.to_list():
         resolved_fml = sub._fml
 
-        experiment_hash = None
-        if isinstance(data, pd.DataFrame):
-            params = {k: v for k, v in bound_args.items() if k != "data"}
-            params["fml"] = resolved_fml
-            params["model_fn"] = model_fn_name
-            if applied_steps:
-                params["steps"] = applied_steps
-            experiment_hash = compute_experiment_hash(data, params, global_version)
+        params = {k: v for k, v in bound_args.items() if k != "data"}
+        params["fml"] = resolved_fml
+        params["model_fn"] = model_fn_name
+        if applied_steps:
+            params["steps"] = applied_steps
+        experiment_hash = compute_experiment_hash(
+            dataset_version, params, global_version
+        )
 
-        if experiment_hash is not None and _already_logged(experiment_hash):
+        if _already_logged(experiment_hash):
             results.append(sub)
             continue
 
@@ -545,15 +603,15 @@ def _log_multi(
             mlflow.log_param("model_fn", model_fn_name)
             if sub_name is not None:
                 mlflow.log_param("name", sub_name)
+            mlflow.log_param("dataset_version", dataset_version)
             if applied_steps:
                 mlflow.log_param("steps", ",".join(applied_steps))
-            if experiment_hash is not None:
-                mlflow.log_param("experiment_hash", experiment_hash)
+            mlflow.log_param("experiment_hash", experiment_hash)
             mlflow.log_param("fml", resolved_fml)
             if original_fml is not None and original_fml != resolved_fml:
                 mlflow.log_param("fml_original", original_fml)
-            if isinstance(data, pd.DataFrame):
-                mlflow.log_param("data_shape", str(data.shape))
+            if data_shape is not None:
+                mlflow.log_param("data_shape", str(data_shape))
             if vcov is not None:
                 mlflow.log_param("vcov", str(vcov))
 
@@ -661,7 +719,8 @@ def etable(
     drop: str | list[str] | None = None,
     filter_string: str | None = None,
     type: str = "df",
-) -> pd.DataFrame | str:
+    backend: str = "polars",
+) -> Any:
     """Build a cross-run regression table from the logged runs.
 
     Reconstructs a side-by-side comparison -- one column per run (oldest first),
@@ -681,19 +740,23 @@ def etable(
     ``filter_string`` is forwarded to ``mlflow.search_runs`` to restrict which runs
     become columns (e.g. ``"tags.`mlflow.runName` = 'baseline'"``). ``type="df"``
     (default) returns a DataFrame; ``type="md"`` returns a markdown string (with
-    formula pipes escaped). Returns an empty DataFrame/string if nothing matches.
+    formula pipes escaped). ``backend`` (``"polars"`` by default, or ``"pandas"``)
+    selects the DataFrame type -- for ``"polars"`` the row labels (coefficients and
+    stats) become a leading ``term`` column, since polars has no row index.
+    Returns an empty DataFrame/string if nothing matches.
     """
     if type not in ("df", "md"):
         raise ValueError(f"type must be 'df' or 'md', got {type!r}")
 
-    runs = results_table(experiment_name, filter_string=filter_string)
+    runs = results_table(experiment_name, filter_string=filter_string, backend="pandas")
     if runs.empty:
-        return runs if type == "df" else ""
+        return _to_backend(runs, backend) if type == "df" else ""
     coefs = coeftable(
         experiment_name,
         coefficients=coefficients,
         drop=drop,
         filter_string=filter_string,
+        backend="pandas",
     )
 
     stat_rows = ("fml", "vcov", "nobs", "r2", "adj_r2", "pseudo_r2", "deviance")
@@ -733,7 +796,10 @@ def etable(
         escaped = table.map(_md_escape)
         escaped.index = [_md_escape(i) for i in escaped.index]
         return escaped.to_markdown()
-    return table
+    if backend == "pandas":
+        return table
+    # polars has no row index, so move the coefficient/stat labels into a column
+    return _to_backend(table.rename_axis("term").reset_index(), backend)
 
 
 def _search_runs(
@@ -758,7 +824,8 @@ def _search_runs(
 def results_table(
     experiment_name: str | None = None,
     filter_string: str | None = None,
-) -> pd.DataFrame:
+    backend: str = "polars",
+) -> Any:
     """Return a tidy one-row-per-run comparison table of logged runs.
 
     A thin, readable wrapper over ``mlflow.search_runs`` so you don't hand-write
@@ -772,18 +839,19 @@ def results_table(
     one. ``filter_string`` is forwarded to ``mlflow.search_runs`` for arbitrary
     server-side filtering -- e.g. by a run's ``name``
     (``"tags.`mlflow.runName` = 'baseline'"``), a metric (``"metrics.r2 > 0.9"``),
-    or a param. Returns an empty DataFrame if nothing matches.
+    or a param. ``backend`` (``"polars"`` by default, or ``"pandas"``) selects the
+    returned DataFrame type. Returns an empty DataFrame if nothing matches.
     """
     runs = _search_runs(experiment_name, filter_string)
 
     if runs.empty:
-        return runs
+        return _to_backend(runs, backend)
 
     params = [c for c in runs.columns if c.startswith("params.")]
     metrics = [c for c in runs.columns if c.startswith("metrics.")]
     columns = ["run_id", *params, *metrics]
     renamed = {c: c.split(".", 1)[1] for c in params + metrics}
-    return runs[columns].rename(columns=renamed)
+    return _to_backend(runs[columns].rename(columns=renamed), backend)
 
 
 def coeftable(
@@ -791,7 +859,8 @@ def coeftable(
     coefficients: str | list[str] | None = None,
     drop: str | list[str] | None = None,
     filter_string: str | None = None,
-) -> pd.DataFrame:
+    backend: str = "polars",
+) -> Any:
     """Return a coefficient-level table across an experiment's runs.
 
     Reads each run's logged ``coefficients.json`` artifact (via
@@ -805,13 +874,14 @@ def coeftable(
     coefficient rows; ``drop`` (a name or list) removes them -- with both, the keep
     is applied first, then the drop. ``filter_string`` is forwarded to
     ``mlflow.search_runs`` to restrict which runs are included (e.g.
-    ``"tags.`mlflow.runName` = 'baseline'"``). Returns an empty DataFrame if
-    nothing matches.
+    ``"tags.`mlflow.runName` = 'baseline'"``). ``backend`` (``"polars"`` by default,
+    or ``"pandas"``) selects the returned DataFrame type. Returns an empty DataFrame
+    if nothing matches.
     """
     runs = _search_runs(experiment_name, filter_string)
 
     if runs.empty:
-        return runs
+        return _to_backend(runs, backend)
 
     run_ids = runs["run_id"].tolist()
     table = mlflow.load_table(
@@ -831,121 +901,38 @@ def coeftable(
         names = [drop] if isinstance(drop, str) else list(drop)
         table = table[~table["coefficient"].isin(names)]
 
-    return table.reset_index(drop=True)
+    return _to_backend(table.reset_index(drop=True), backend)
 
 
-# --- Content-based hashing ---------------------------------------------------
+# --- Experiment hashing ------------------------------------------------------
 # Kept in this module so the template is a single self-contained file to copy:
 # no intra-template import to rewrite when it lands in someone else's project.
 
 
 def compute_experiment_hash(
-    data: pd.DataFrame,
+    dataset_version: str,
     model_params: dict[str, Any],
     global_version: str,
 ) -> str:
-    """Hash a pyfixest experiment from its data, model params, and version.
+    """Hash a pyfixest experiment from its dataset version, model params, version.
 
     The hash depends on:
-    - ``data``: hashed by content (via ``pandas.util.hash_pandas_object``), so
-      identical values always hash the same regardless of object identity or
-      whether the DataFrame was copied. Only the columns the model actually reads
-      are hashed (see ``_used_columns``): the formula variables plus the cluster,
-      weight, offset and split columns named in ``model_params``. Unrelated columns
-      in the frame therefore do not affect the hash, and the used columns are hashed
-      in sorted order so column order in the frame does not either. If the used
-      columns cannot be determined, the whole frame is hashed instead (conservative:
-      a smaller-but-wrong column set could collide two genuinely different runs).
-      The row index participates in the hash, so a reindexed or reordered frame
-      hashes differently even with identical values; pass a frame with a stable
-      index (e.g. ``reset_index(drop=True)``) if you want order-only differences
-      ignored.
-    - ``model_params``: the model call's parameters (e.g. formula, vcov) *and* the
-      modeling function's name, hashed via a deterministic JSON serialization. The
-      function name is included so that, e.g., ``feols`` and ``quantreg`` on the
-      same data and formula do not collide.
-    - ``global_version``: an external version tag (e.g. a pipeline or
-      dataset-build version) supplied by the caller.
-
-    Note: narrowing the data hash to the used columns changes the hash for every
-    experiment relative to older versions that hashed the whole frame, so each
-    previously logged run re-logs once after upgrading. Bump ``global_version`` if
-    you want that re-log to be explicit rather than incidental.
+    - ``dataset_version``: a caller-supplied tag asserting which version of the
+      data the run used. The data itself is *not* hashed -- you own data identity
+      via this tag, so bump it whenever the underlying data changes (default
+      ``"v1"`` in ``regress``). This keeps the hash cheap and dataframe-agnostic.
+    - ``model_params``: the model call's parameters (e.g. formula, vcov), the
+      modeling function's name, and any applied feature ``steps``, hashed via a
+      deterministic JSON serialization. The function name is included so that, e.g.,
+      ``feols`` and ``quantreg`` on the same formula do not collide.
+    - ``global_version``: a general version tag, e.g. to force a re-log across an
+      experiment.
     """
     hasher = hashlib.sha256()
     hasher.update(str(global_version).encode())
-    hasher.update(_hash_data(data, _used_columns(data, model_params)))
+    hasher.update(str(dataset_version).encode())
     hasher.update(_hash_model_params(model_params))
     return hasher.hexdigest()
-
-
-def _hash_data(data: pd.DataFrame, columns: list[str] | None) -> bytes:
-    """Hash the given columns of ``data`` (or the whole frame if ``columns`` is
-    None), index included."""
-    frame = data if columns is None else data[columns]
-    col_repr = ",".join(map(str, frame.columns))
-    row_hashes = pd.util.hash_pandas_object(frame, index=True).to_numpy()
-    return col_repr.encode() + row_hashes.tobytes()
-
-
-def _used_columns(data: pd.DataFrame, model_params: dict[str, Any]) -> list[str] | None:
-    """The columns the model reads, as a sorted list, or None to hash everything.
-
-    A pyfixest call touches more of the frame than the bare formula variables:
-    besides everything in ``fml`` (transforms, interactions, fixed effects after
-    ``|``, IV instruments after a second ``|``), it reads the cluster columns named
-    in a ``vcov`` dict (e.g. ``{"CRV1": "firm"}``) and the ``weights`` / ``offset``
-    / ``split`` / ``fsplit`` columns. Formula variables are pulled with the same
-    parser pyfixest uses (``pyfixest``'s ``Formula.parse`` to split the spec, then
-    ``formulaic`` to list each part's variables) rather than a regex, so transforms
-    and interactions are handled correctly.
-
-    Returns None -- meaning "hash the whole frame" -- if anything about the
-    extraction fails or yields nothing usable. That is deliberately conservative:
-    over-hashing (including a column the model ignores) at worst logs a duplicate
-    run as distinct, whereas under-hashing (missing a column the model reads) would
-    let two genuinely different runs collide onto one hash and silently drop the
-    second.
-    """
-    try:
-        from formulaic import Formula as _FormulaicFormula
-
-        fml = model_params.get("fml")
-        if fml is not None:
-            names = _formula_variables(fml)
-            # ``_formula_variables`` returns None for a multi-model spec (sw()/csw()
-            # or several LHS variables) or a parse failure -- no single column set,
-            # so bail to the full-frame hash.
-            if names is None:
-                return None
-            names = set(names)
-        else:
-            names = set()
-
-        def _vars(expr: str | None) -> set[str]:
-            if not expr:
-                return set()
-            return set(_FormulaicFormula(expr).required_variables)
-
-        vcov = model_params.get("vcov")
-        if isinstance(vcov, dict):
-            for cluster in vcov.values():
-                names |= _vars(cluster)
-
-        for key in ("weights", "offset", "split", "fsplit"):
-            value = model_params.get(key)
-            if isinstance(value, str):
-                names.add(value)
-
-        # Keep only real columns of this frame. formulaic reports function tokens
-        # as variables too (e.g. `i` from pyfixest's ``i(...)`` interaction), and a
-        # caller could name a column absent from the frame; intersecting drops both.
-        used = [str(c) for c in data.columns if c in names]
-        if not used:
-            return None
-        return sorted(used)  # sorted -> hash is invariant to frame column order
-    except Exception:
-        return None
 
 
 def _formula_variables(fml: str) -> set[str] | None:
