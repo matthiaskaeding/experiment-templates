@@ -95,9 +95,93 @@ def _extract_metrics(fit: Any) -> dict[str, float]:
 def _bind_args(
     model_fn: Callable[..., Any], args: tuple[Any, ...], kwargs: dict[str, Any]
 ) -> dict[str, Any]:
-    """Map positional/keyword call args to model_fn's parameter names."""
-    bound = inspect.signature(model_fn).bind_partial(*args, **kwargs)
-    return bound.arguments
+    """Map positional/keyword call args to model_fn's parameter names.
+
+    The returned dict is the single representation of the model call: feature
+    steps replace its ``data`` entry, and the fit is ``model_fn(**bound_args)``.
+    That requires every bound parameter to be passable by keyword, so
+    positional-only parameters are rejected up front with a clear error
+    (pyfixest's estimators have none; this only bites exotic user-supplied
+    ``model_fn`` callables).
+
+    A ``**kwargs`` catch-all in the signature (user-supplied wrappers like
+    ``def wrapper(*args, **kwargs)``) is flattened into the dict, so ``data``
+    passed through it is still addressable by name -- and stays out of the
+    experiment hash. Arguments captured by a ``*args`` catch-all have no names
+    to flatten to; they are kept under the catch-all's own key and passed back
+    positionally by ``_call_model_fn``.
+    """
+    signature = inspect.signature(model_fn)
+    positional_only = [
+        name
+        for name, p in signature.parameters.items()
+        if p.kind is inspect.Parameter.POSITIONAL_ONLY
+    ]
+    if positional_only:
+        raise TypeError(
+            f"model_fn {getattr(model_fn, '__name__', model_fn)!r} has "
+            f"positional-only parameters {positional_only}, which regress does "
+            f"not support (it calls model_fn with keyword arguments only)."
+        )
+    bound = signature.bind_partial(*args, **kwargs)
+    arguments: dict[str, Any] = {}
+    for name, value in bound.arguments.items():
+        if signature.parameters[name].kind is inspect.Parameter.VAR_KEYWORD:
+            arguments.update(value)
+        else:
+            arguments[name] = value
+    return arguments
+
+
+def _call_model_fn(model_fn: Callable[..., Any], bound_args: dict[str, Any]) -> Any:
+    """Call ``model_fn(**bound_args)``.
+
+    The one exception to the pure keyword call: arguments that were captured by
+    a ``*args`` catch-all (kept under that parameter's own key by ``_bind_args``)
+    are handed back positionally, since they have no keyword names.
+    """
+    var_positional = next(
+        (
+            name
+            for name, p in inspect.signature(model_fn).parameters.items()
+            if p.kind is inspect.Parameter.VAR_POSITIONAL
+        ),
+        None,
+    )
+    if var_positional is None or var_positional not in bound_args:
+        return model_fn(**bound_args)
+    keywords = {k: v for k, v in bound_args.items() if k != var_positional}
+    return model_fn(*bound_args[var_positional], **keywords)
+
+
+def _apply_steps(bound_args: dict[str, Any], steps: list[Any]) -> None:
+    """Fit and apply the feature ``steps`` to ``bound_args["data"]`` in place."""
+    from features import fit_steps as _fit_steps
+
+    data_pd = _to_pandas(bound_args.get("data"))
+    transformed, _states, _tags = _fit_steps(data_pd, steps)
+    bound_args["data"] = transformed
+
+
+def _fit(
+    model_fn: Callable[..., Any],
+    bound_args: dict[str, Any],
+    steps: list[Any] | None,
+) -> Any:
+    """The single place a model is fitted.
+
+    Applies the feature steps (if any) to the bound ``data``, calls the
+    estimator, and rejects a fit that unexpectedly fanned out into multiple
+    models (split=/fsplit=, which regress does not support). Every caller --
+    the dedup early return and the logged run -- goes through here, so the fit
+    is identical whether or not it is being logged.
+    """
+    if steps:
+        _apply_steps(bound_args, steps)
+    fit = _call_model_fn(model_fn, bound_args)
+    if isinstance(fit, FixestMulti):
+        raise ValueError(_MULTI_MODEL_ERROR)
+    return fit
 
 
 def _to_pandas(data: Any) -> pd.DataFrame | None:
@@ -320,8 +404,10 @@ def regress(
 
     ``model_fn`` (default ``pyfixest.feols``) is either a pyfixest modeling function
     (e.g. ``pyfixest.fepois``, ``pyfixest.feglm``, ``pyfixest.quantreg``) or its name
-    as a string (e.g. ``"fepois"``), resolved via ``getattr(pyfixest, model_fn)``. It
-    is called as ``model_fn(*args, **kwargs)``.
+    as a string (e.g. ``"fepois"``), resolved via ``getattr(pyfixest, model_fn)``.
+    The call arguments are bound to its parameter names and it is called with
+    keyword arguments only (``model_fn(**bound_args)``), so ``model_fn`` must not
+    have positional-only parameters (pyfixest's estimators have none).
 
     All input validation happens before the MLflow run is opened, so a bad input
     never leaves a FAILED run behind: binding the call arguments (a signature
@@ -398,44 +484,35 @@ def regress(
     ``compute_experiment_hash`` and logged as the ``experiment_hash`` param. The
     data itself is *not* hashed -- you assert which version of the data a run used
     with ``dataset_version`` (default ``"v1"``), so bump it whenever the underlying
-    data changes. Before logging, the active experiment is checked for a run with
-    that same hash; if one exists, this call skips logging entirely (no duplicate
-    run is created). The model is *always* re-fitted and returned either way -- only
-    the MLflow logging is skipped -- since MLflow stores metrics/artifacts, not the
-    live fit object. Note that logging configuration (``key_coefs`` /
-    ``n_key_coefs``) is not part of the hash: an experiment already logged with
-    different key coefficients will still be skipped as a duplicate; bump
-    ``global_version`` (or ``dataset_version``) to force a re-log.
+    data changes. Before fitting, the active experiment is checked for a FINISHED
+    run with the same hash. On a hit, the model is still fitted -- through the same
+    ``_fit`` path as a logged run -- and returned; only the logging is skipped, so
+    no duplicate run is created. MLflow stores metrics/artifacts, not the live fit
+    object, which is why the fit always happens. Note that logging configuration
+    (``key_coefs`` / ``n_key_coefs``) is not part of the hash: an experiment
+    already logged with different key coefficients will still be skipped as a
+    duplicate; bump ``global_version`` (or ``dataset_version``) to force a re-log.
     """
     model_fn = _resolve_model_fn(model_fn)
 
-    # Validate inputs before opening any MLflow run, so a bad formula raises
-    # without leaving a FAILED run polluting the experiment history.
+    # --- 1. Validate (before any run: bad input never pollutes history) ------
     bound_args = _bind_args(model_fn, args, kwargs)
     fml = bound_args.get("fml")
     data = bound_args.get("data")
     vcov = bound_args.get("vcov")
 
-    # Feature steps run in pandas: convert the (dataframe-agnostic) input, apply
-    # the named transforms, and substitute the transformed frame back into the call
-    # so the fit sees it. The applied name@version tags become part of the run's
-    # identity (logged and hashed), so a version bump forces a re-log.
+    data_shape = _data_shape(data)
+
+    # Feature steps: resolve the name@version tags now (validates that each
+    # feature is registered and constructible) for the hash and params; the
+    # data-dependent transform itself runs later, inside _fit.
     applied_steps: list[str] = []
     if steps:
-        data_pd = _to_pandas(data)
-        if data_pd is None:
+        if data_shape is None:
             raise TypeError("steps require `data` to be a dataframe")
-        from features import fit_steps as _fit_steps
+        from features import plan_steps as _plan_steps
 
-        data, _states, applied_steps = _fit_steps(data_pd, steps)
-        bound_args["data"] = data
-        if "data" in kwargs:
-            kwargs = {**kwargs, "data": data}
-        else:
-            idx = list(inspect.signature(model_fn).parameters).index("data")
-            args = tuple(data if i == idx else a for i, a in enumerate(args))
-
-    data_shape = _data_shape(data)
+        applied_steps = _plan_steps(steps)
 
     # A multi-model formula (csw()/sw() or several dependent variables) fans out
     # into one resolved model per spec; each is logged as its own run below.
@@ -452,9 +529,14 @@ def regress(
         )
     has_explicit_experiment = experiment_name is not None or experiment_id is not None
 
+    # Multi-model formulas are fitted once and logged per resolved model; dedup
+    # happens per model inside _log_multi. Steps are applied directly (not via
+    # _fit) because here the fan-out into a FixestMulti is expected, not an error.
     if is_multi:
+        if steps:
+            _apply_steps(bound_args, steps)
         return _log_multi(
-            model_fn(*args, **kwargs),
+            _call_model_fn(model_fn, bound_args),
             name=name,
             tags=tags,
             model_fn_name=getattr(model_fn, "__name__", str(model_fn)),
@@ -469,6 +551,7 @@ def regress(
             has_explicit_experiment=has_explicit_experiment,
         )
 
+    # --- 2. Decide (whether to log -- never whether or how to fit) -----------
     model_params = {k: v for k, v in bound_args.items() if k != "data"}
     model_params["model_fn"] = getattr(model_fn, "__name__", str(model_fn))
     if applied_steps:
@@ -477,24 +560,23 @@ def regress(
         dataset_version, model_params, global_version
     )
 
-    # Dedup hit: skip all logging (no new run), but still fit and return the model.
+    # Dedup hit: nothing to log, just fit and hand the model back.
     if _already_logged(experiment_hash):
-        fit = model_fn(*args, **kwargs)
-        if isinstance(fit, FixestMulti):
-            raise ValueError(_MULTI_MODEL_ERROR)
-        return fit
+        return _fit(model_fn, bound_args, steps)
 
+    # --- 3. Execute: fit and log ---------------------------------------------
     with mlflow.start_run(run_name=name, tags=tags) as run:
         # If no experiment was selected and none was set beforehand, the run lands
         # in MLflow's implicit "Default" experiment. That is allowed but almost
         # never intended, so surface it instead of letting it pass silently.
         if (
-            experiment_name is None
-            and experiment_id is None
+            not has_explicit_experiment
             and run.info.experiment_id == _DEFAULT_EXPERIMENT_ID
         ):
             warnings.warn(_NO_EXPERIMENT_WARNING, stacklevel=2)
 
+        # Identity params first, so a failing fit still records what was
+        # attempted (formula, hash, data shape, vcov, steps).
         mlflow.log_param("model_fn", getattr(model_fn, "__name__", str(model_fn)))
         # Log the user-given name as a param too (the run_name/tag MLflow always
         # sets is auto-generated when name is None, so it can't tell a real name
@@ -512,20 +594,15 @@ def regress(
         if vcov is not None:
             mlflow.log_param("vcov", str(vcov))
 
-        # Fit inside the run, after the params are logged: if estimation fails,
-        # the run still records what was attempted (formula, hash, data shape,
-        # vcov), gets an `error` tag with the exception, is marked FAILED by the
-        # context manager, and the exception propagates to the caller.
+        # A step or estimation failure gets an `error` tag, the run is marked
+        # FAILED by the context manager, and the exception propagates.
         start = time.perf_counter()
         try:
-            fit = model_fn(*args, **kwargs)
+            fit = _fit(model_fn, bound_args, steps)
         except Exception as exc:
             mlflow.set_tag("error", f"{type(exc).__name__}: {exc}"[:500])
             raise
         estimation_time = time.perf_counter() - start
-
-        if isinstance(fit, FixestMulti):
-            raise ValueError(_MULTI_MODEL_ERROR)
 
         metrics = _fit_metrics(fit, estimation_time)
         mlflow.log_metrics(metrics)

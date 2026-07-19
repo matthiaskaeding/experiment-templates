@@ -235,6 +235,25 @@ def fit_steps(
     return current, states, tags
 
 
+def plan_steps(steps: list[Step]) -> list[str]:
+    """Resolve ``steps`` to the ``"name@version(...)"`` tags ``fit_steps`` would
+    produce, without touching any data.
+
+    Instantiates each transform from its params (construction never touches
+    data, per the module contract), so an unregistered name or bad params raise
+    here -- letting callers validate a pipeline and compute its identity before
+    the data-dependent ``fit_steps`` runs. The tags use the transform's
+    *resolved* ``.params``, exactly as ``fit_steps`` tags them.
+    """
+    tags: list[str] = []
+    for step in steps:
+        name, params = _normalize_step(step)
+        feat = get_feature(name)
+        obj = feat.cls(**params)
+        tags.append(_tag(name, feat.version, obj.params))
+    return tags
+
+
 def apply_states(df: pd.DataFrame, states: list[dict]) -> pd.DataFrame:
     """Replay a fitted pipeline (from ``fit_steps``/``load_pipeline``) on ``df``.
 
