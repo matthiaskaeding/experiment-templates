@@ -42,8 +42,9 @@ underlying data changes. `global_version` is a separate general knob to force a
 re-log.
 
 Multi-model formulas work too: a stepwise `csw()`/`sw()` sweep (or several
-dependent variables) is fitted once and logged as one run per resolved model,
-and `regress` returns the list of fits. Each run records the resolved `fml` plus
+dependent variables) is expanded into its resolved models and each is fitted and
+logged as its own run — through the exact same path as a standalone call — and
+`regress` returns the list of fits. Each run records the resolved `fml` plus
 `fml_original` (the formula as written), so `etable("exp")` lines the sweep up
 side by side and `results_table` can group it via `fml_original`.
 
