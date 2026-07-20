@@ -112,6 +112,46 @@ def test_regress_csw_dedups_against_standalone_run(tmp_path):
     assert set(runs["fml"]) == {"Y ~ X1", "Y ~ X1 + X2"}
 
 
+def test_regress_csw_failure_is_recorded_as_failed_run(tmp_path):
+    mlflow.set_tracking_uri(f"sqlite:///{tmp_path}/mlflow.db")
+    data = pf.get_data()  # X1 is ~N(0, 1) -> has non-positive values
+
+    # each sub-model goes through the standard single-model path, so a failure
+    # inside the sweep (here: a step failing on the data) leaves a FAILED run
+    # instead of vanishing before anything is logged
+    with pytest.raises(ValueError, match="non-positive"):
+        regress(
+            "Y ~ csw(X1, X2)",
+            data=data,
+            steps=[("log", {"columns": ["X1"]})],
+            experiment_name="csw-fail",
+        )
+
+    runs = mlflow.search_runs(experiment_names=["csw-fail"], run_view_type=ViewType.ALL)
+    failed = runs[runs["status"] == "FAILED"]
+    assert len(failed) == 1
+    assert failed.iloc[0]["params.fml"] == "Y ~ X1"  # the first resolved model
+    assert failed.iloc[0]["params.fml_original"] == "Y ~ csw(X1, X2)"
+
+
+def test_regress_csw_accepts_key_coefs_absent_from_early_models(tmp_path):
+    mlflow.set_tracking_uri(f"sqlite:///{tmp_path}/mlflow.db")
+    data = pf.get_data()
+
+    # X2 is a variable of the formula as written but not of the first resolved
+    # model (Y ~ X1); validation runs against the original formula, and models
+    # without the coefficient simply don't log it
+    fits = regress(
+        "Y ~ csw(X1, X2)", data=data, key_coefs="X2", experiment_name="csw-keys"
+    )
+
+    assert len(fits) == 2
+    runs = results_table("csw-keys", backend="pandas")
+    with_x2 = runs[runs["fml"] == "Y ~ X1 + X2"]
+    assert "coef.X2" in runs.columns
+    assert with_x2["coef.X2"].notna().all()
+
+
 def test_regress_rejects_split(tmp_path):
     mlflow.set_tracking_uri(f"sqlite:///{tmp_path}/mlflow.db")
     data = pf.get_data()
