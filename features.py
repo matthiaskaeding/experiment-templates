@@ -37,7 +37,6 @@ Uses only pandas, numpy, and the standard library (no sklearn, no pickle).
 
 from __future__ import annotations
 
-import inspect
 import json
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -57,39 +56,13 @@ class FeatureTransform(ABC):
     abstract; ``fit`` (for stateless transforms), ``transform``, ``fit_transform``
     and ``from_state`` are concrete defaults that subclasses inherit and do not
     override (except ``fit``, overridden by stateful transforms).
+
+    A transform's configuration is just the params it was built with -- the
+    pipeline records those (see ``fit_steps``) and replays them via ``from_state``;
+    the instance does not carry a separate resolved copy.
     """
 
     state: dict | None = None  # class-attribute default: None = not fitted
-
-    @property
-    def params(self) -> dict:
-        """The configuration this transform was built with, derived from its
-        ``__init__`` signature: every parameter except ``self``, read off the
-        instance. Lets ``from_state(t.state, **t.params)`` rebuild a fitted
-        transform without a separately stored params dict.
-
-        This requires each constructor argument to be stored on ``self`` under the
-        *same* name; if one isn't (e.g. ``__init__(self, columns)`` that does
-        ``self.col = columns``), a clear ``AttributeError`` explains the fix instead
-        of a bare missing-attribute error.
-        """
-        names = [
-            name
-            for name in inspect.signature(type(self).__init__).parameters
-            if name != "self"
-        ]
-        params = {}
-        for name in names:
-            try:
-                params[name] = getattr(self, name)
-            except AttributeError:
-                raise AttributeError(
-                    f"{type(self).__name__}.params expected attribute {name!r} "
-                    f"(a parameter of __init__), but it is not set. Store each "
-                    f"constructor argument on self under the same name, e.g. "
-                    f"`self.{name} = {name}`."
-                ) from None
-        return params
 
     def fit(self, train: pd.DataFrame) -> FeatureTransform:
         """Default for stateless transforms: learn nothing, but mark as fitted by
@@ -189,9 +162,9 @@ def _normalize_step(step: Step) -> tuple[str, dict]:
 
 def _tag(name: str, version: str, params: dict) -> str:
     """A compact ``"name@version"`` tag, with ``(k=v,...)`` (sorted keys) appended
-    for the params that are set, e.g. ``"winsorize@1(col=income,q=0.01)"``. Params
-    left at ``None`` (an unset default, e.g. ``columns=None`` meaning "all") are
-    omitted so a bare step reads as ``"standardize@1"``."""
+    for the params that were passed, e.g. ``"winsorize@1(col=income)"``. Params
+    passed as ``None`` (e.g. ``columns=None`` meaning "all") are omitted, as are
+    params left to their default, so a bare step reads as ``"standardize@1"``."""
     shown = {k: v for k, v in params.items() if v is not None}
     tag = f"{name}@{version}"
     if shown:
@@ -208,11 +181,12 @@ def fit_steps(
     Each step is a registered name (``"standardize"``) or a ``(name, params)`` pair
     (``("log", {"columns": ["income"]})``). For each step the class is looked up,
     instantiated as ``cls(**params)``, and ``fit_transform``-ed on the current
-    frame, carrying the result forward. The stored/tagged params are the transform's
-    *resolved* ``.params`` (so defaults are captured too, e.g. ``winsorize``'s
-    ``q=0.01``). Returns ``(transformed_train, states, tags)`` where ``states`` is a
-    list of ``{"name", "version", "params", "state"}`` dicts (ready for
-    ``save_pipeline``) and ``tags`` is the list of ``"name@version(...)"`` tags.
+    frame, carrying the result forward. The stored/tagged params are the step's own
+    ``params`` as given (defaults are not expanded -- a transform's behavior is
+    pinned by its ``version``, so a bare step reads as ``"standardize@1"``). Returns
+    ``(transformed_train, states, tags)`` where ``states`` is a list of
+    ``{"name", "version", "params", "state"}`` dicts (ready for ``save_pipeline``)
+    and ``tags`` is the list of ``"name@version(...)"`` tags.
     """
     current = train
     states: list[dict] = []
@@ -222,16 +196,15 @@ def fit_steps(
         feat = get_feature(name)
         obj = feat.cls(**params)
         current = obj.fit_transform(current)
-        resolved = obj.params
         states.append(
             {
                 "name": name,
                 "version": feat.version,
-                "params": resolved,
+                "params": params,
                 "state": obj.state,
             }
         )
-        tags.append(_tag(name, feat.version, resolved))
+        tags.append(_tag(name, feat.version, params))
     return current, states, tags
 
 
@@ -239,18 +212,16 @@ def plan_steps(steps: list[Step]) -> list[str]:
     """Resolve ``steps`` to the ``"name@version(...)"`` tags ``fit_steps`` would
     produce, without touching any data.
 
-    Instantiates each transform from its params (construction never touches
-    data, per the module contract), so an unregistered name or bad params raise
-    here -- letting callers validate a pipeline and compute its identity before
-    the data-dependent ``fit_steps`` runs. The tags use the transform's
-    *resolved* ``.params``, exactly as ``fit_steps`` tags them.
+    Normalizes each step and looks up its registered ``version`` -- so an
+    unregistered name raises here -- to build the same tags ``fit_steps`` would,
+    without instantiating anything. Lets callers validate a pipeline and compute
+    its identity before the data-dependent ``fit_steps`` runs.
     """
     tags: list[str] = []
     for step in steps:
         name, params = _normalize_step(step)
         feat = get_feature(name)
-        obj = feat.cls(**params)
-        tags.append(_tag(name, feat.version, obj.params))
+        tags.append(_tag(name, feat.version, params))
     return tags
 
 

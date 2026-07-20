@@ -126,7 +126,7 @@ def regress(
     ``steps=["standardize", ("log", {"columns": ["income"]})]``) fits and applies
     those feature transformations to ``data``, in order, before fitting (via
     ``features.fit_steps``); steps run in pandas, so with a non-pandas frame the
-    transformed data is passed on as pandas. The resolved ``name@version`` tags are
+    transformed data is passed on as pandas. Their ``name@version(params)`` tags are
     logged as the ``steps`` param and folded into the hash, so the data preparation
     is part of the run's identity and bumping a transform's version forces a
     re-log. The ``features`` module is imported only when ``steps`` are given, so

@@ -39,12 +39,12 @@ def _frame():
 
 def test_from_state_round_trip():
     train = _frame()
-    t = Standardize(columns=["income"]).fit(train)
+    params = {"columns": ["income"]}
+    t = Standardize(**params).fit(train)
 
-    # params is derived from the __init__ signature, so this reconstructs t exactly
-    rebuilt = type(t).from_state(t.state, **t.params)
+    # from_state rebuilds the config from the params it was constructed with
+    rebuilt = type(t).from_state(t.state, **params)
 
-    assert t.params == {"columns": ["income"]}
     pd.testing.assert_frame_equal(t.transform(train), rebuilt.transform(train))
 
 
@@ -242,24 +242,10 @@ def test_fit_transform_equals_fit_then_transform():
     pd.testing.assert_frame_equal(a, b)
 
 
-def test_params_gives_helpful_error_on_misnamed_attribute():
-    @feature("_misnamed_attr", version="1")
-    class _Misnamed(FeatureTransform):
-        def __init__(self, columns):
-            self.col = columns  # bug: attribute name != constructor arg name
-
-        def _transform(self, df):
-            return df
-
-    t = _Misnamed(columns=["x"])
-    with pytest.raises(AttributeError, match=r"expected attribute 'columns'"):
-        _ = t.params
-
-
 def test_plan_steps_resolves_tags_without_data():
-    # same tags as fit_steps would produce, but no data touched (no fit)
+    # same tags as fit_steps would produce, but no data touched (no instantiation)
     tags = plan_steps([("winsorize", {"col": "income"}), "standardize"])
-    assert tags == ["winsorize@1(col=income,q=0.01)", "standardize@1"]
+    assert tags == ["winsorize@1(col=income)", "standardize@1"]
 
 
 def test_plan_steps_validates_feature_names():
@@ -267,14 +253,18 @@ def test_plan_steps_validates_feature_names():
         plan_steps(["definitely_not_registered"])
 
 
-def test_tag_format_sorts_param_keys_and_shows_resolved_defaults():
-    df = pd.DataFrame({"income": [10.0, 20.0, 30.0]})
+def test_tag_format_sorts_param_keys_and_omits_defaults():
+    df = pd.DataFrame({"income": [10.0, 20.0, 30.0, 40.0]})
 
-    # q is left to its default; the tag still shows it (params is resolved from the
-    # instance), with keys sorted
-    _, _, tags = fit_steps(df, [("winsorize", {"col": "income"})])
-    assert tags == ["winsorize@1(col=income,q=0.01)"]
+    # both params passed -> shown with keys sorted (col before q)
+    _, _, tags = fit_steps(df, [("winsorize", {"q": 0.25, "col": "income"})])
+    assert tags == ["winsorize@1(col=income,q=0.25)"]
 
-    # a bare step with only None-valued params (columns=None -> "all") has no suffix
+    # q left to its default -> not expanded into the tag (the version pins behavior,
+    # not the resolved default value)
+    _, _, only_col = fit_steps(df, [("winsorize", {"col": "income"})])
+    assert only_col == ["winsorize@1(col=income)"]
+
+    # a bare step (no params) has no suffix
     _, _, bare = fit_steps(df, ["standardize"])
     assert bare == ["standardize@1"]

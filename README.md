@@ -136,7 +136,7 @@ save_pipeline(states, "pipeline.json")
 new = apply_states(serve_df, load_pipeline("pipeline.json"))
 ```
 
-`fit_steps` records each step's resolved `name@version(params)` tag; `apply_states`
+`fit_steps` records each step's `name@version(params)` tag; `apply_states`
 rehydrates each transform via `from_state` and refuses to run if a step's stored
 version no longer matches the registry. Three transforms ship: `standardize`,
 `log` (adds `<col>_log` columns; the suffix is a parameter), and `winsorize`.
