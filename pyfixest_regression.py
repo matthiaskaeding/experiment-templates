@@ -39,6 +39,240 @@ _NO_EXPERIMENT_WARNING = (
 )
 
 
+def regress(
+    *args: Any,
+    model_fn: Callable[..., Any] | str = pf.feols,
+    name: str | None = None,
+    experiment_name: str | None = None,
+    experiment_id: str | None = None,
+    tags: dict[str, str] | None = None,
+    global_version: str = "0",
+    key_coefs: str | list[str] | None = None,
+    n_key_coefs: int = 5,
+    steps: list[str | tuple[str, dict]] | None = None,
+    dataset_version: str = "v1",
+    **kwargs: Any,
+) -> Any:
+    """Call a pyfixest modeling function inside a tracked MLflow run.
+
+    ``model_fn`` (default ``pyfixest.feols``) is either a pyfixest modeling function
+    (e.g. ``pyfixest.fepois``, ``pyfixest.feglm``, ``pyfixest.quantreg``) or its name
+    as a string (e.g. ``"fepois"``), resolved via ``getattr(pyfixest, model_fn)``.
+    The call arguments are bound to its parameter names and it is called with
+    keyword arguments only (``model_fn(**bound_args)``), so ``model_fn`` must not
+    have positional-only parameters (pyfixest's estimators have none).
+
+    All input validation happens before the MLflow run is opened, so a bad input
+    never leaves a FAILED run behind: binding the call arguments (a signature
+    mismatch raises ``TypeError``) and parsing the formula (a malformed formula
+    raises ``FormulaSyntaxError``) both run first.
+
+    Multi-model formulas are supported as syntactic sugar: a formula that fans out
+    into several models (``csw()``/``sw()`` stepwise, or multiple dependent
+    variables) is fitted once and each resolved model is logged as its own run,
+    and the list of fitted models is returned. Every such run records the resolved
+    ``fml`` plus ``fml_original`` (the formula as written), so a sweep can be
+    grouped back together, and dedup is per resolved model. A single-model formula
+    returns the one fitted model as before. (``split=``/``fsplit=`` also produce
+    multiple models but are not supported and raise a ``ValueError``.)
+
+    Estimation errors, by contrast, *are* recorded: the fit runs inside the MLflow
+    run, after the parameters are logged. If ``model_fn`` raises, the run remains
+    in the store (status FAILED) with the formula/hash/params and an ``error`` tag
+    holding the exception, so the failed attempt can be recovered later; the
+    exception is then re-raised.
+
+    Which metrics get logged depends on the model type (e.g. ``fepois`` has no R2):
+    ``_extract_metrics`` picks the relevant (metric_name, attribute) pairs based on
+    the type of the fitted result. Metrics are logged to MLflow together with the
+    coefficient table and, when the model type supports it, a human-readable
+    regression table (pyfixest ``etable``) as a ``summary.html`` artifact. The
+    object returned by ``model_fn`` is returned unchanged.
+
+    Only key parameters are logged: the formula, the data's shape, and vcov.
+
+    ``name`` is an optional human-readable descriptor of the regression, used as
+    the MLflow *run name*. It does not select or override the experiment, and it is
+    fine to omit: the run is already identified by its content (formula + data +
+    settings, via the experiment hash below).
+
+    Experiment selection: pass ``experiment_name`` or ``experiment_id`` (mutually
+    exclusive) to have MLflow use that experiment. If neither is given, the run
+    uses whatever experiment is already active (e.g. set once via
+    ``mlflow.set_experiment(...)`` at the top of a script). If nothing was set at
+    all -- the run would land in MLflow's implicit "Default" experiment -- a
+    ``UserWarning`` is issued and logging proceeds there.
+
+    Key coefficients are logged as first-class, searchable metrics by default --
+    three numeric metrics each, ``coef.<name>`` (estimate) / ``se.<name>`` /
+    ``pvalue.<name>`` -- so they can be filtered, sorted, and plotted in the MLflow
+    store/UI (e.g. ``search_runs(filter_string='metrics.`coef.treat` > 0')``).
+    ``key_coefs`` (a coefficient name or list) picks which -- use it for the
+    coefficient you actually care about, e.g. a treatment effect, since selecting
+    by position is unreliable (the intercept comes first, ``C()``/``i()``
+    expansions reorder). Names in ``key_coefs`` must be variables of the formula;
+    a name that isn't raises a ``ValueError`` before any run is opened (a typo'd
+    coefficient should fail loudly, not silently log nothing). When ``key_coefs``
+    is not given it falls back to the first ``n_key_coefs`` coefficients (default
+    5); the cap matters because dummy- or fixed-effect-heavy specs can have
+    hundreds of coefficients. Pass ``n_key_coefs=0`` (with no ``key_coefs``) to log
+    none. Only numbers are logged -- stars and CIs are rendered from them elsewhere
+    -- and the complete coefficient table always remains in the
+    ``coefficients.json`` artifact.
+
+    ``data`` is dataframe-agnostic: pandas, polars, or anything pyfixest accepts
+    (via narwhals) works, and the fit receives it as given. ``steps`` (a list of
+    names -- or ``(name, params)`` pairs -- from the ``features`` registry, e.g.
+    ``steps=["standardize", ("log", {"columns": ["income"]})]``) fits and applies
+    those feature transformations to ``data``, in order, before fitting (via
+    ``features.fit_steps``); steps run in pandas, so with a non-pandas frame the
+    transformed data is passed on as pandas. The resolved ``name@version`` tags are
+    logged as the ``steps`` param and folded into the hash, so the data preparation
+    is part of the run's identity and bumping a transform's version forces a
+    re-log. The ``features`` module is imported only when ``steps`` are given, so
+    the template still works as a single file otherwise.
+
+    Deduplication: a hash of (``dataset_version``, model params including
+    ``model_fn`` and any ``steps``, ``global_version``) is computed via
+    ``compute_experiment_hash`` and logged as the ``experiment_hash`` param. The
+    data itself is *not* hashed -- you assert which version of the data a run used
+    with ``dataset_version`` (default ``"v1"``), so bump it whenever the underlying
+    data changes. Before fitting, the active experiment is checked for a FINISHED
+    run with the same hash. On a hit, the model is still fitted -- through the same
+    ``_fit`` path as a logged run -- and returned; only the logging is skipped, so
+    no duplicate run is created. MLflow stores metrics/artifacts, not the live fit
+    object, which is why the fit always happens. Note that logging configuration
+    (``key_coefs`` / ``n_key_coefs``) is not part of the hash: an experiment
+    already logged with different key coefficients will still be skipped as a
+    duplicate; bump ``global_version`` (or ``dataset_version``) to force a re-log.
+    """
+    model_fn = _resolve_model_fn(model_fn)
+
+    # --- 1. Validate (before any run: bad input never pollutes history) ------
+    bound_args = _bind_args(model_fn, args, kwargs)
+    fml = bound_args.get("fml")
+    data = bound_args.get("data")
+    vcov = bound_args.get("vcov")
+
+    data_shape = _data_shape(data)
+
+    # Feature steps: resolve the name@version tags now (validates that each
+    # feature is registered and constructible) for the hash and params; the
+    # data-dependent transform itself runs later, inside _fit.
+    step_tags: list[str] = []
+    if steps:
+        if data_shape is None:
+            raise TypeError("steps require `data` to be a dataframe")
+        from features import plan_steps as _plan_steps
+
+        step_tags = _plan_steps(steps)
+
+    # A multi-model formula (csw()/sw() or several dependent variables) fans out
+    # into one resolved model per spec; each is logged as its own run below.
+    is_multi = fml is not None and len(Formula.parse(fml)) > 1
+
+    if key_coefs is not None and fml is not None:
+        _validate_key_coefs(key_coefs, fml)
+
+    if experiment_name is not None and experiment_id is not None:
+        raise ValueError("Pass either experiment_name or experiment_id, not both.")
+    if experiment_name is not None or experiment_id is not None:
+        mlflow.set_experiment(
+            experiment_name=experiment_name, experiment_id=experiment_id
+        )
+    has_explicit_experiment = experiment_name is not None or experiment_id is not None
+
+    # Multi-model formulas are fitted once and logged per resolved model; dedup
+    # happens per model inside _log_multi. Steps are applied directly (not via
+    # _fit) because here the fan-out into a FixestMulti is expected, not an error.
+    if is_multi:
+        if steps:
+            bound_args["data"] = _apply_steps(bound_args["data"], steps)
+        return _log_multi(
+            _call_model_fn(model_fn, bound_args),
+            name=name,
+            tags=tags,
+            model_fn_name=getattr(model_fn, "__name__", str(model_fn)),
+            bound_args=bound_args,
+            data_shape=data_shape,
+            vcov=vcov,
+            global_version=global_version,
+            dataset_version=dataset_version,
+            key_coefs=key_coefs,
+            n_key_coefs=n_key_coefs,
+            step_tags=step_tags,
+            has_explicit_experiment=has_explicit_experiment,
+        )
+
+    # --- 2. Decide (whether to log -- never whether or how to fit) -----------
+    model_params = {k: v for k, v in bound_args.items() if k != "data"}
+    model_params["model_fn"] = getattr(model_fn, "__name__", str(model_fn))
+    if step_tags:
+        model_params["steps"] = step_tags
+    experiment_hash = compute_experiment_hash(
+        dataset_version, model_params, global_version
+    )
+
+    # Dedup hit: nothing to log, just fit and hand the model back.
+    if _already_logged(experiment_hash):
+        return _fit(model_fn, bound_args, steps)
+
+    # --- 3. Execute: fit and log ---------------------------------------------
+    with mlflow.start_run(run_name=name, tags=tags) as run:
+        # If no experiment was selected and none was set beforehand, the run lands
+        # in MLflow's implicit "Default" experiment. That is allowed but almost
+        # never intended, so surface it instead of letting it pass silently.
+        if (
+            not has_explicit_experiment
+            and run.info.experiment_id == _DEFAULT_EXPERIMENT_ID
+        ):
+            warnings.warn(_NO_EXPERIMENT_WARNING, stacklevel=2)
+
+        # Identity params first, so a failing fit still records what was
+        # attempted (formula, hash, data shape, vcov, steps).
+        mlflow.log_param("model_fn", getattr(model_fn, "__name__", str(model_fn)))
+        # Log the user-given name as a param too (the run_name/tag MLflow always
+        # sets is auto-generated when name is None, so it can't tell a real name
+        # from a random one; the param is present only when the user named the run).
+        if name is not None:
+            mlflow.log_param("name", name)
+        mlflow.log_param("dataset_version", dataset_version)
+        if step_tags:
+            mlflow.log_param("steps", ",".join(step_tags))
+        mlflow.log_param("experiment_hash", experiment_hash)
+        if fml is not None:
+            mlflow.log_param("fml", fml)
+        if data_shape is not None:
+            mlflow.log_param("data_shape", str(data_shape))
+        if vcov is not None:
+            mlflow.log_param("vcov", str(vcov))
+
+        # A step or estimation failure gets an `error` tag, the run is marked
+        # FAILED by the context manager, and the exception propagates.
+        start = time.perf_counter()
+        try:
+            fit = _fit(model_fn, bound_args, steps)
+        except Exception as exc:
+            mlflow.set_tag("error", f"{type(exc).__name__}: {exc}"[:500])
+            raise
+        estimation_time = time.perf_counter() - start
+
+        metrics = _fit_metrics(fit, estimation_time)
+        mlflow.log_metrics(metrics)
+
+        _log_key_coefficients(fit, _select_key_coefs(fit, key_coefs, n_key_coefs))
+
+        mlflow.log_table(_tidy_coefficients(fit), artifact_file="coefficients.json")
+
+        # A human-readable regression table, alongside the tidy coefficients, to
+        # eyeball runs in the MLflow UI (or anywhere markdown renders). Built from
+        # the same information that is logged anyway, so it works for every model
+        # type -- no dependency on pf.etable supporting the fit.
+        mlflow.log_text(_summary_markdown(fit, metrics), "summary.md")
+
+    return fit
+
+
 def _extract_metrics(fit: Any) -> dict[str, float]:
     """Read the metrics relevant to ``fit`` off it via direct access.
 
@@ -384,240 +618,6 @@ def _already_logged(experiment_hash: str) -> bool:
         max_results=1,
     )
     return not runs.empty
-
-
-def regress(
-    *args: Any,
-    model_fn: Callable[..., Any] | str = pf.feols,
-    name: str | None = None,
-    experiment_name: str | None = None,
-    experiment_id: str | None = None,
-    tags: dict[str, str] | None = None,
-    global_version: str = "0",
-    key_coefs: str | list[str] | None = None,
-    n_key_coefs: int = 5,
-    steps: list[str | tuple[str, dict]] | None = None,
-    dataset_version: str = "v1",
-    **kwargs: Any,
-) -> Any:
-    """Call a pyfixest modeling function inside a tracked MLflow run.
-
-    ``model_fn`` (default ``pyfixest.feols``) is either a pyfixest modeling function
-    (e.g. ``pyfixest.fepois``, ``pyfixest.feglm``, ``pyfixest.quantreg``) or its name
-    as a string (e.g. ``"fepois"``), resolved via ``getattr(pyfixest, model_fn)``.
-    The call arguments are bound to its parameter names and it is called with
-    keyword arguments only (``model_fn(**bound_args)``), so ``model_fn`` must not
-    have positional-only parameters (pyfixest's estimators have none).
-
-    All input validation happens before the MLflow run is opened, so a bad input
-    never leaves a FAILED run behind: binding the call arguments (a signature
-    mismatch raises ``TypeError``) and parsing the formula (a malformed formula
-    raises ``FormulaSyntaxError``) both run first.
-
-    Multi-model formulas are supported as syntactic sugar: a formula that fans out
-    into several models (``csw()``/``sw()`` stepwise, or multiple dependent
-    variables) is fitted once and each resolved model is logged as its own run,
-    and the list of fitted models is returned. Every such run records the resolved
-    ``fml`` plus ``fml_original`` (the formula as written), so a sweep can be
-    grouped back together, and dedup is per resolved model. A single-model formula
-    returns the one fitted model as before. (``split=``/``fsplit=`` also produce
-    multiple models but are not supported and raise a ``ValueError``.)
-
-    Estimation errors, by contrast, *are* recorded: the fit runs inside the MLflow
-    run, after the parameters are logged. If ``model_fn`` raises, the run remains
-    in the store (status FAILED) with the formula/hash/params and an ``error`` tag
-    holding the exception, so the failed attempt can be recovered later; the
-    exception is then re-raised.
-
-    Which metrics get logged depends on the model type (e.g. ``fepois`` has no R2):
-    ``_extract_metrics`` picks the relevant (metric_name, attribute) pairs based on
-    the type of the fitted result. Metrics are logged to MLflow together with the
-    coefficient table and, when the model type supports it, a human-readable
-    regression table (pyfixest ``etable``) as a ``summary.html`` artifact. The
-    object returned by ``model_fn`` is returned unchanged.
-
-    Only key parameters are logged: the formula, the data's shape, and vcov.
-
-    ``name`` is an optional human-readable descriptor of the regression, used as
-    the MLflow *run name*. It does not select or override the experiment, and it is
-    fine to omit: the run is already identified by its content (formula + data +
-    settings, via the experiment hash below).
-
-    Experiment selection: pass ``experiment_name`` or ``experiment_id`` (mutually
-    exclusive) to have MLflow use that experiment. If neither is given, the run
-    uses whatever experiment is already active (e.g. set once via
-    ``mlflow.set_experiment(...)`` at the top of a script). If nothing was set at
-    all -- the run would land in MLflow's implicit "Default" experiment -- a
-    ``UserWarning`` is issued and logging proceeds there.
-
-    Key coefficients are logged as first-class, searchable metrics by default --
-    three numeric metrics each, ``coef.<name>`` (estimate) / ``se.<name>`` /
-    ``pvalue.<name>`` -- so they can be filtered, sorted, and plotted in the MLflow
-    store/UI (e.g. ``search_runs(filter_string='metrics.`coef.treat` > 0')``).
-    ``key_coefs`` (a coefficient name or list) picks which -- use it for the
-    coefficient you actually care about, e.g. a treatment effect, since selecting
-    by position is unreliable (the intercept comes first, ``C()``/``i()``
-    expansions reorder). Names in ``key_coefs`` must be variables of the formula;
-    a name that isn't raises a ``ValueError`` before any run is opened (a typo'd
-    coefficient should fail loudly, not silently log nothing). When ``key_coefs``
-    is not given it falls back to the first ``n_key_coefs`` coefficients (default
-    5); the cap matters because dummy- or fixed-effect-heavy specs can have
-    hundreds of coefficients. Pass ``n_key_coefs=0`` (with no ``key_coefs``) to log
-    none. Only numbers are logged -- stars and CIs are rendered from them elsewhere
-    -- and the complete coefficient table always remains in the
-    ``coefficients.json`` artifact.
-
-    ``data`` is dataframe-agnostic: pandas, polars, or anything pyfixest accepts
-    (via narwhals) works, and the fit receives it as given. ``steps`` (a list of
-    names -- or ``(name, params)`` pairs -- from the ``features`` registry, e.g.
-    ``steps=["standardize", ("log", {"columns": ["income"]})]``) fits and applies
-    those feature transformations to ``data``, in order, before fitting (via
-    ``features.fit_steps``); steps run in pandas, so with a non-pandas frame the
-    transformed data is passed on as pandas. The resolved ``name@version`` tags are
-    logged as the ``steps`` param and folded into the hash, so the data preparation
-    is part of the run's identity and bumping a transform's version forces a
-    re-log. The ``features`` module is imported only when ``steps`` are given, so
-    the template still works as a single file otherwise.
-
-    Deduplication: a hash of (``dataset_version``, model params including
-    ``model_fn`` and any ``steps``, ``global_version``) is computed via
-    ``compute_experiment_hash`` and logged as the ``experiment_hash`` param. The
-    data itself is *not* hashed -- you assert which version of the data a run used
-    with ``dataset_version`` (default ``"v1"``), so bump it whenever the underlying
-    data changes. Before fitting, the active experiment is checked for a FINISHED
-    run with the same hash. On a hit, the model is still fitted -- through the same
-    ``_fit`` path as a logged run -- and returned; only the logging is skipped, so
-    no duplicate run is created. MLflow stores metrics/artifacts, not the live fit
-    object, which is why the fit always happens. Note that logging configuration
-    (``key_coefs`` / ``n_key_coefs``) is not part of the hash: an experiment
-    already logged with different key coefficients will still be skipped as a
-    duplicate; bump ``global_version`` (or ``dataset_version``) to force a re-log.
-    """
-    model_fn = _resolve_model_fn(model_fn)
-
-    # --- 1. Validate (before any run: bad input never pollutes history) ------
-    bound_args = _bind_args(model_fn, args, kwargs)
-    fml = bound_args.get("fml")
-    data = bound_args.get("data")
-    vcov = bound_args.get("vcov")
-
-    data_shape = _data_shape(data)
-
-    # Feature steps: resolve the name@version tags now (validates that each
-    # feature is registered and constructible) for the hash and params; the
-    # data-dependent transform itself runs later, inside _fit.
-    step_tags: list[str] = []
-    if steps:
-        if data_shape is None:
-            raise TypeError("steps require `data` to be a dataframe")
-        from features import plan_steps as _plan_steps
-
-        step_tags = _plan_steps(steps)
-
-    # A multi-model formula (csw()/sw() or several dependent variables) fans out
-    # into one resolved model per spec; each is logged as its own run below.
-    is_multi = fml is not None and len(Formula.parse(fml)) > 1
-
-    if key_coefs is not None and fml is not None:
-        _validate_key_coefs(key_coefs, fml)
-
-    if experiment_name is not None and experiment_id is not None:
-        raise ValueError("Pass either experiment_name or experiment_id, not both.")
-    if experiment_name is not None or experiment_id is not None:
-        mlflow.set_experiment(
-            experiment_name=experiment_name, experiment_id=experiment_id
-        )
-    has_explicit_experiment = experiment_name is not None or experiment_id is not None
-
-    # Multi-model formulas are fitted once and logged per resolved model; dedup
-    # happens per model inside _log_multi. Steps are applied directly (not via
-    # _fit) because here the fan-out into a FixestMulti is expected, not an error.
-    if is_multi:
-        if steps:
-            bound_args["data"] = _apply_steps(bound_args["data"], steps)
-        return _log_multi(
-            _call_model_fn(model_fn, bound_args),
-            name=name,
-            tags=tags,
-            model_fn_name=getattr(model_fn, "__name__", str(model_fn)),
-            bound_args=bound_args,
-            data_shape=data_shape,
-            vcov=vcov,
-            global_version=global_version,
-            dataset_version=dataset_version,
-            key_coefs=key_coefs,
-            n_key_coefs=n_key_coefs,
-            step_tags=step_tags,
-            has_explicit_experiment=has_explicit_experiment,
-        )
-
-    # --- 2. Decide (whether to log -- never whether or how to fit) -----------
-    model_params = {k: v for k, v in bound_args.items() if k != "data"}
-    model_params["model_fn"] = getattr(model_fn, "__name__", str(model_fn))
-    if step_tags:
-        model_params["steps"] = step_tags
-    experiment_hash = compute_experiment_hash(
-        dataset_version, model_params, global_version
-    )
-
-    # Dedup hit: nothing to log, just fit and hand the model back.
-    if _already_logged(experiment_hash):
-        return _fit(model_fn, bound_args, steps)
-
-    # --- 3. Execute: fit and log ---------------------------------------------
-    with mlflow.start_run(run_name=name, tags=tags) as run:
-        # If no experiment was selected and none was set beforehand, the run lands
-        # in MLflow's implicit "Default" experiment. That is allowed but almost
-        # never intended, so surface it instead of letting it pass silently.
-        if (
-            not has_explicit_experiment
-            and run.info.experiment_id == _DEFAULT_EXPERIMENT_ID
-        ):
-            warnings.warn(_NO_EXPERIMENT_WARNING, stacklevel=2)
-
-        # Identity params first, so a failing fit still records what was
-        # attempted (formula, hash, data shape, vcov, steps).
-        mlflow.log_param("model_fn", getattr(model_fn, "__name__", str(model_fn)))
-        # Log the user-given name as a param too (the run_name/tag MLflow always
-        # sets is auto-generated when name is None, so it can't tell a real name
-        # from a random one; the param is present only when the user named the run).
-        if name is not None:
-            mlflow.log_param("name", name)
-        mlflow.log_param("dataset_version", dataset_version)
-        if step_tags:
-            mlflow.log_param("steps", ",".join(step_tags))
-        mlflow.log_param("experiment_hash", experiment_hash)
-        if fml is not None:
-            mlflow.log_param("fml", fml)
-        if data_shape is not None:
-            mlflow.log_param("data_shape", str(data_shape))
-        if vcov is not None:
-            mlflow.log_param("vcov", str(vcov))
-
-        # A step or estimation failure gets an `error` tag, the run is marked
-        # FAILED by the context manager, and the exception propagates.
-        start = time.perf_counter()
-        try:
-            fit = _fit(model_fn, bound_args, steps)
-        except Exception as exc:
-            mlflow.set_tag("error", f"{type(exc).__name__}: {exc}"[:500])
-            raise
-        estimation_time = time.perf_counter() - start
-
-        metrics = _fit_metrics(fit, estimation_time)
-        mlflow.log_metrics(metrics)
-
-        _log_key_coefficients(fit, _select_key_coefs(fit, key_coefs, n_key_coefs))
-
-        mlflow.log_table(_tidy_coefficients(fit), artifact_file="coefficients.json")
-
-        # A human-readable regression table, alongside the tidy coefficients, to
-        # eyeball runs in the MLflow UI (or anywhere markdown renders). Built from
-        # the same information that is logged anyway, so it works for every model
-        # type -- no dependency on pf.etable supporting the fit.
-        mlflow.log_text(_summary_markdown(fit, metrics), "summary.md")
-
-    return fit
 
 
 def _log_multi(
