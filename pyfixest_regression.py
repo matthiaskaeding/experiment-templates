@@ -49,104 +49,64 @@ def regress(
     global_version: str = "0",
     key_coefs: str | list[str] | None = None,
     n_key_coefs: int = 5,
-    steps: list[str | tuple[str, dict]] | None = None,
+    steps: list[str | tuple[str, dict[str, Any]]] | None = None,
     dataset_version: str = "v1",
     **kwargs: Any,
 ) -> Any:
-    """Call a pyfixest modeling function inside a tracked MLflow run.
+    """Fit a pyfixest model inside a tracked, deduplicated MLflow run.
 
-    ``model_fn`` (default ``pyfixest.feols``) is either a pyfixest modeling function
-    (e.g. ``pyfixest.fepois``, ``pyfixest.feglm``, ``pyfixest.quantreg``) or its name
-    as a string (e.g. ``"fepois"``), resolved via ``getattr(pyfixest, model_fn)``.
-    The call arguments are bound to its parameter names and it is called with
-    keyword arguments only (``model_fn(**bound_args)``), so ``model_fn`` must not
-    have positional-only parameters (pyfixest's estimators have none).
+    Inputs are validated before any run opens (so bad input never leaves a FAILED
+    run), then the model is fitted and its params, metrics, coefficient table
+    (``coefficients.json``), and a markdown summary (``summary.md``) are logged.
+    A multi-model formula (``csw()``/``sw()`` or several dependent variables) is
+    expanded and logged as one run per resolved model, returning the list of fits;
+    each such run also records ``fml_original`` so the sweep can be regrouped.
+    Runs are deduplicated on a content hash, so re-running an identical spec logs
+    nothing (the model is still fitted and returned). A step or estimation failure
+    is recorded as a FAILED run with an ``error`` tag, then re-raised.
 
-    All input validation happens before the MLflow run is opened, so a bad input
-    never leaves a FAILED run behind: binding the call arguments (a signature
-    mismatch raises ``TypeError``) and parsing the formula (a malformed formula
-    raises ``FormulaSyntaxError``) both run first.
+    Args:
+        *args: Positional arguments forwarded to ``model_fn`` -- typically the
+            formula and ``data`` (dataframe-agnostic: pandas, polars, or anything
+            pyfixest accepts via narwhals). Bound by name, so they may also be
+            passed as keywords.
+        model_fn: A pyfixest estimator (e.g. ``pyfixest.fepois``) or its name as a
+            string (e.g. ``"fepois"``). Defaults to ``pyfixest.feols``.
+        name: Human-readable descriptor used as the MLflow run name. Does not
+            affect experiment selection or the dedup identity.
+        experiment_name: Select the target experiment by name. Mutually exclusive
+            with ``experiment_id``; if neither is given the active experiment is
+            used (a ``UserWarning`` is issued if that is the implicit "Default").
+        experiment_id: Select the target experiment by id. Mutually exclusive with
+            ``experiment_name``.
+        tags: Extra MLflow tags to set on the run.
+        global_version: General knob folded into the hash; bump it to force a
+            re-log of otherwise-identical runs.
+        key_coefs: Coefficient name(s) to log as searchable ``coef.<name>`` /
+            ``se.<name>`` / ``pvalue.<name>`` metrics. Must be variables of the
+            formula (else ``ValueError``). Defaults to the first ``n_key_coefs``.
+        n_key_coefs: How many leading coefficients to log when ``key_coefs`` is not
+            given (``0`` logs none). The full table is always in
+            ``coefficients.json`` regardless.
+        steps: Feature transformations from the ``features`` registry -- names or
+            ``(name, params)`` pairs, e.g.
+            ``["standardize", ("log", {"columns": ["income"]})]`` -- applied to
+            ``data`` in order before fitting. Their ``name@version(params)`` tags
+            are folded into the hash, so a transform's version is part of the run's
+            identity. ``features`` is imported only when ``steps`` is given.
+        dataset_version: Asserts which version of the data the run used; part of
+            the dedup hash (the data itself is *not* hashed). Bump it when the
+            underlying data changes.
+        **kwargs: Keyword arguments forwarded to ``model_fn`` (e.g. ``vcov``).
 
-    Multi-model formulas are supported as syntactic sugar: a formula that fans out
-    into several models (``csw()``/``sw()`` stepwise, or multiple dependent
-    variables) is expanded into its resolved single-model formulas, each run
-    through the same internal path as a standalone call (``_run_single``: dedup,
-    FAILED-run recording, per-model ``estimation_time``), and the list of fitted
-    models is returned. Every such run records the resolved ``fml`` plus
-    ``fml_original`` (the formula as written), so a sweep can be grouped back
-    together, and dedup is per resolved model. A single-model formula returns the
-    one fitted model as before. (``split=``/``fsplit=`` also produce multiple
-    models but are not supported and raise a ``ValueError``.)
+    Returns:
+        The fitted pyfixest model, or a ``list`` of them for a multi-model formula.
 
-    Estimation errors, by contrast, *are* recorded: the fit runs inside the MLflow
-    run, after the parameters are logged. If ``model_fn`` raises, the run remains
-    in the store (status FAILED) with the formula/hash/params and an ``error`` tag
-    holding the exception, so the failed attempt can be recovered later; the
-    exception is then re-raised.
-
-    Which metrics get logged depends on the model type (e.g. ``fepois`` has no R2):
-    ``_extract_metrics`` picks the relevant (metric_name, attribute) pairs based on
-    the type of the fitted result. Metrics are logged to MLflow together with the
-    coefficient table and, when the model type supports it, a human-readable
-    regression table (pyfixest ``etable``) as a ``summary.html`` artifact. The
-    object returned by ``model_fn`` is returned unchanged.
-
-    Only key parameters are logged: the formula, the data's shape, and vcov.
-
-    ``name`` is an optional human-readable descriptor of the regression, used as
-    the MLflow *run name*. It does not select or override the experiment, and it is
-    fine to omit: the run is already identified by its content (formula + data +
-    settings, via the experiment hash below).
-
-    Experiment selection: pass ``experiment_name`` or ``experiment_id`` (mutually
-    exclusive) to have MLflow use that experiment. If neither is given, the run
-    uses whatever experiment is already active (e.g. set once via
-    ``mlflow.set_experiment(...)`` at the top of a script). If nothing was set at
-    all -- the run would land in MLflow's implicit "Default" experiment -- a
-    ``UserWarning`` is issued and logging proceeds there.
-
-    Key coefficients are logged as first-class, searchable metrics by default --
-    three numeric metrics each, ``coef.<name>`` (estimate) / ``se.<name>`` /
-    ``pvalue.<name>`` -- so they can be filtered, sorted, and plotted in the MLflow
-    store/UI (e.g. ``search_runs(filter_string='metrics.`coef.treat` > 0')``).
-    ``key_coefs`` (a coefficient name or list) picks which -- use it for the
-    coefficient you actually care about, e.g. a treatment effect, since selecting
-    by position is unreliable (the intercept comes first, ``C()``/``i()``
-    expansions reorder). Names in ``key_coefs`` must be variables of the formula;
-    a name that isn't raises a ``ValueError`` before any run is opened (a typo'd
-    coefficient should fail loudly, not silently log nothing). When ``key_coefs``
-    is not given it falls back to the first ``n_key_coefs`` coefficients (default
-    5); the cap matters because dummy- or fixed-effect-heavy specs can have
-    hundreds of coefficients. Pass ``n_key_coefs=0`` (with no ``key_coefs``) to log
-    none. Only numbers are logged -- stars and CIs are rendered from them elsewhere
-    -- and the complete coefficient table always remains in the
-    ``coefficients.json`` artifact.
-
-    ``data`` is dataframe-agnostic: pandas, polars, or anything pyfixest accepts
-    (via narwhals) works, and the fit receives it as given. ``steps`` (a list of
-    names -- or ``(name, params)`` pairs -- from the ``features`` registry, e.g.
-    ``steps=["standardize", ("log", {"columns": ["income"]})]``) fits and applies
-    those feature transformations to ``data``, in order, before fitting (via
-    ``features.fit_steps``); steps run in pandas, so with a non-pandas frame the
-    transformed data is passed on as pandas. Their ``name@version(params)`` tags are
-    logged as the ``steps`` param and folded into the hash, so the data preparation
-    is part of the run's identity and bumping a transform's version forces a
-    re-log. The ``features`` module is imported only when ``steps`` are given, so
-    the template still works as a single file otherwise.
-
-    Deduplication: a hash of (``dataset_version``, model params including
-    ``model_fn`` and any ``steps``, ``global_version``) is computed via
-    ``compute_experiment_hash`` and logged as the ``experiment_hash`` param. The
-    data itself is *not* hashed -- you assert which version of the data a run used
-    with ``dataset_version`` (default ``"v1"``), so bump it whenever the underlying
-    data changes. Before fitting, the active experiment is checked for a FINISHED
-    run with the same hash. On a hit, the model is still fitted -- through the same
-    ``_fit`` path as a logged run -- and returned; only the logging is skipped, so
-    no duplicate run is created. MLflow stores metrics/artifacts, not the live fit
-    object, which is why the fit always happens. Note that logging configuration
-    (``key_coefs`` / ``n_key_coefs``) is not part of the hash: an experiment
-    already logged with different key coefficients will still be skipped as a
-    duplicate; bump ``global_version`` (or ``dataset_version``) to force a re-log.
+    Raises:
+        ValueError: Both experiment selectors given, an unknown ``key_coefs``
+            name, or an unsupported multi-model source (``split=``/``fsplit=``).
+        TypeError: ``steps`` given without a dataframe ``data``, or call arguments
+            that do not match ``model_fn``'s signature.
     """
     model_fn = _resolve_model_fn(model_fn)
 
@@ -235,7 +195,7 @@ def _run_single(
     dataset_version: str,
     key_coefs: str | list[str] | None,
     n_key_coefs: int,
-    steps: list[str | tuple[str, dict]] | None,
+    steps: list[str | tuple[str, dict[str, Any]]] | None,
     step_tags: list[str],
     has_explicit_experiment: bool,
     fml_original: str | None,
