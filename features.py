@@ -40,11 +40,16 @@ from __future__ import annotations
 import json
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from typing import Any, Callable, TypeVar
 
 import numpy as np
 import pandas as pd
 
-Step = str | tuple[str, dict]
+Step = str | tuple[str, dict[str, Any]]
+
+# A FeatureTransform subclass, preserved through the @feature decorator so a
+# decorated class keeps its own type (not erased to the base) for the checker.
+_TransformT = TypeVar("_TransformT", bound="FeatureTransform")
 
 
 class FeatureTransform(ABC):
@@ -89,7 +94,7 @@ class FeatureTransform(ABC):
         return self.fit(train).transform(train)
 
     @classmethod
-    def from_state(cls, state: dict, **params) -> FeatureTransform:
+    def from_state(cls, state: dict, **params: Any) -> FeatureTransform:
         """Reconstruct a fitted instance without refitting: build ``cls(**params)``
         (the same config the transform was created with) and attach ``state``."""
         obj = cls(**params)
@@ -112,15 +117,18 @@ class Feature:
 _REGISTRY: dict[str, Feature] = {}
 
 
-def feature(name: str, version: str):
+def feature(
+    name: str, version: str
+) -> Callable[[type[_TransformT]], type[_TransformT]]:
     """Class decorator registering a ``FeatureTransform`` subclass.
 
     Raises ``TypeError`` if the decorated object is not a ``FeatureTransform``
     subclass, and ``ValueError`` if ``name`` is already registered. ``version`` is
-    coerced to ``str``.
+    coerced to ``str``. Returns the class unchanged (same type), so decorated
+    subclasses keep their own type.
     """
 
-    def decorator(cls: type[FeatureTransform]) -> type[FeatureTransform]:
+    def decorator(cls: type[_TransformT]) -> type[_TransformT]:
         if not isinstance(cls, type) or not issubclass(cls, FeatureTransform):
             raise TypeError(
                 f"@feature can only decorate FeatureTransform subclasses; got {cls!r}"
