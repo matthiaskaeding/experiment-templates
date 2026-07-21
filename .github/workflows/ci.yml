@@ -34,11 +34,8 @@ jobs:
       - name: Ruff format check
         run: uv run ruff format --check .
 
-      # Type-check the template source. Scoped to the modules (not the tests),
-      # whose type hints are the copy-paste product; the test suite still
-      # trips mlflow's list[Run] | DataFrame stub union in many places.
       - name: Type check (ty)
-        run: uv run ty check pyfixest_regression.py features.py
+        run: uv run ty check
 
       # Plain invocation is rename-proof: it picks up `testpaths` from
       # pyproject.toml rather than hardcoding a folder.
