@@ -8,7 +8,7 @@ import json
 import re
 import time
 import warnings
-from typing import Any, Callable
+from typing import Any, Callable, cast
 
 import mlflow
 import pandas as pd
@@ -403,7 +403,11 @@ def _apply_steps(data: Any, steps: list[Any]) -> pd.DataFrame:
     frame. Steps run in pandas, so a non-pandas frame comes back as pandas."""
     from features import fit_steps as _fit_steps
 
-    transformed, _states, _tags = _fit_steps(_to_pandas(data), steps)
+    frame = _to_pandas(data)
+    # regress validates that data is a dataframe before any step runs, so this
+    # is never None here; assert to narrow it for the type checker.
+    assert frame is not None
+    transformed, _states, _tags = _fit_steps(frame, steps)
     return transformed
 
 
@@ -620,12 +624,17 @@ def _already_logged(experiment_hash: str) -> bool:
     is recoverable), and it must not suppress logging of a successful retry with
     identical inputs.
     """
-    runs = mlflow.search_runs(
-        filter_string=(
-            f"params.experiment_hash = '{experiment_hash}' "
-            "and attributes.status = 'FINISHED'"
+    # search_runs returns a DataFrame for the default output_format="pandas"; the
+    # stub's list[Run] | DataFrame union is for output_format="list", unused here.
+    runs = cast(
+        pd.DataFrame,
+        mlflow.search_runs(
+            filter_string=(
+                f"params.experiment_hash = '{experiment_hash}' "
+                "and attributes.status = 'FINISHED'"
+            ),
+            max_results=1,
         ),
-        max_results=1,
     )
     return not runs.empty
 
@@ -822,7 +831,8 @@ def _search_runs(
         kwargs["experiment_names"] = [experiment_name]
     if filter_string is not None:
         kwargs["filter_string"] = filter_string
-    return mlflow.search_runs(**kwargs)
+    # DataFrame for the default output_format="pandas" (see _already_logged).
+    return cast(pd.DataFrame, mlflow.search_runs(**kwargs))
 
 
 def results_table(

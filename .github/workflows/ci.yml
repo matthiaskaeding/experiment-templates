@@ -34,6 +34,13 @@ jobs:
       - name: Ruff format check
         run: uv run ruff format --check .
 
+      # Type-check with ty (pre-1.0), reported but non-blocking: it surfaces
+      # type issues in the CI log without failing the build -- useful signal
+      # without gating merges on a young checker (or on mlflow's stub unions).
+      - name: Type check (ty, non-blocking)
+        continue-on-error: true
+        run: uv run ty check
+
       # Plain invocation is rename-proof: it picks up `testpaths` from
       # pyproject.toml rather than hardcoding a folder.
       - name: Pytest

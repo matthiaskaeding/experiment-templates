@@ -325,6 +325,7 @@ class Standardize(FeatureTransform):
         return self
 
     def _transform(self, df: pd.DataFrame) -> pd.DataFrame:
+        assert self.state is not None  # guaranteed fitted: transform() guards it
         cols, mu, sd = self.state["cols"], self.state["mu"], self.state["sd"]
         out = df.copy()
         for c in cols:
@@ -380,6 +381,7 @@ class Winsorize(FeatureTransform):
         return self
 
     def _transform(self, df: pd.DataFrame) -> pd.DataFrame:
+        assert self.state is not None  # guaranteed fitted: transform() guards it
         out = df.copy()
         out[self.col] = out[self.col].clip(self.state["lo"], self.state["hi"])
         return out
