@@ -1,10 +1,11 @@
 import warnings
+from typing import Any, cast
 
 import mlflow
 import pandas as pd
 import pyfixest as pf
 import pytest
-from mlflow.entities import ViewType
+from mlflow.entities import Run, ViewType
 
 from pyfixest_regression import (
     _extract_metrics,
@@ -16,6 +17,20 @@ from pyfixest_regression import (
 )
 
 
+def _last_run() -> Run:
+    """The most recent active run. It always exists at the point these tests read
+    it; the assert both documents that and narrows mlflow's ``Run | None``."""
+    run = mlflow.last_active_run()
+    assert run is not None
+    return run
+
+
+def _search(**kwargs: Any) -> pd.DataFrame:
+    """``mlflow.search_runs`` narrowed to its default pandas return -- the stub's
+    ``list[Run] | DataFrame`` union is for ``output_format="list"``, unused here."""
+    return cast(pd.DataFrame, mlflow.search_runs(**kwargs))
+
+
 def test_regress_logs_single_model(tmp_path):
     mlflow.set_tracking_uri(f"sqlite:///{tmp_path}/mlflow.db")
     data = pf.get_data()
@@ -24,7 +39,7 @@ def test_regress_logs_single_model(tmp_path):
 
     assert fit._r2 is not None
 
-    run = mlflow.last_active_run()
+    run = _last_run()
     metrics = run.data.metrics
     assert metrics["r2"] == fit._r2
     assert metrics["f_statistic"] == fit._f_statistic
@@ -40,7 +55,7 @@ def test_regress_logs_fit_summary_metrics(tmp_path):
 
     fit = regress("Y ~ X1 + X2 | f1 + f2", data=data, experiment_name="fit-summary")
 
-    metrics = mlflow.last_active_run().data.metrics
+    metrics = _last_run().data.metrics
     # X1, X2 remain as coefficients (the two fixed effects are absorbed)
     assert metrics["n_coefs"] == float(len(fit.tidy())) == 2.0
     assert metrics["n_fes"] == 2.0
@@ -52,7 +67,7 @@ def test_regress_logs_zero_fes_without_fixed_effects(tmp_path):
 
     regress("Y ~ X1 + X2", data=pf.get_data(), experiment_name="no-fe")
 
-    assert mlflow.last_active_run().data.metrics["n_fes"] == 0.0
+    assert _last_run().data.metrics["n_fes"] == 0.0
 
 
 def test_regress_logs_vcov_and_accepts_positional_args(tmp_path):
@@ -61,7 +76,7 @@ def test_regress_logs_vcov_and_accepts_positional_args(tmp_path):
 
     fit = regress("Y ~ X1 + X2", data, "hetero", experiment_name="positional-args")
 
-    run = mlflow.last_active_run()
+    run = _last_run()
     assert run.data.params["fml"] == "Y ~ X1 + X2"
     assert run.data.params["data_shape"] == str(data.shape)
     assert run.data.params["vcov"] == "hetero"
@@ -127,7 +142,7 @@ def test_regress_csw_failure_is_recorded_as_failed_run(tmp_path):
             experiment_name="csw-fail",
         )
 
-    runs = mlflow.search_runs(experiment_names=["csw-fail"], run_view_type=ViewType.ALL)
+    runs = _search(experiment_names=["csw-fail"], run_view_type=ViewType.ALL)
     failed = runs[runs["status"] == "FAILED"]
     assert len(failed) == 1
     assert failed.iloc[0]["params.fml"] == "Y ~ X1"  # the first resolved model
@@ -172,7 +187,7 @@ def test_regress_accepts_explicit_model_fn(tmp_path):
         experiment_name="explicit-model-fn",
     )
 
-    run = mlflow.last_active_run()
+    run = _last_run()
     metrics = run.data.metrics
     assert run.data.params["model_fn"] == "fepois"
     assert metrics["nobs"] == fit._N
@@ -194,7 +209,7 @@ def test_regress_logs_feglm_metrics(tmp_path):
         experiment_name="feglm-model-fn",
     )
 
-    run = mlflow.last_active_run()
+    run = _last_run()
     metrics = run.data.metrics
     assert run.data.params["model_fn"] == "feglm"
     assert metrics["nobs"] == fit._N
@@ -215,7 +230,7 @@ def test_regress_logs_quantreg_metrics(tmp_path):
         experiment_name="quantreg-model-fn",
     )
 
-    run = mlflow.last_active_run()
+    run = _last_run()
     metrics = run.data.metrics
     assert run.data.params["model_fn"] == "quantreg"
     # quantreg's only model-level metric is nobs (no r2/f-stat/deviance); the
@@ -237,7 +252,7 @@ def test_regress_accepts_model_fn_as_string(tmp_path):
         experiment_name="string-model-fn",
     )
 
-    run = mlflow.last_active_run()
+    run = _last_run()
     assert run.data.params["model_fn"] == "fepois"
     assert run.data.metrics["nobs"] == fit._N
 
@@ -258,7 +273,7 @@ def test_regress_warns_when_no_experiment_set(tmp_path):
 
     # Logging proceeds (into Default), and the fit is returned as usual.
     assert fit._r2 is not None
-    assert len(mlflow.search_runs(search_all_experiments=True)) == 1
+    assert len(_search(search_all_experiments=True)) == 1
 
 
 def test_regress_name_sets_the_run_name(tmp_path):
@@ -271,7 +286,7 @@ def test_regress_name_sets_the_run_name(tmp_path):
         experiment_name="run-name-test",
     )
 
-    run = mlflow.last_active_run()
+    run = _last_run()
     assert run.data.tags["mlflow.runName"] == "baseline iid spec"
     # name describes the run; the experiment comes from experiment_name
     assert mlflow.get_experiment(run.info.experiment_id).name == "run-name-test"
@@ -295,7 +310,7 @@ def test_regress_accepts_experiment_id(tmp_path):
 
     fit = regress("Y ~ X1 + X2", data=pf.get_data(), experiment_id=exp_id)
 
-    run = mlflow.last_active_run()
+    run = _last_run()
     assert run.info.experiment_id == exp_id
     assert fit._r2 is not None
 
@@ -306,7 +321,7 @@ def test_regress_reuses_already_active_experiment(tmp_path):
 
     fit = regress("Y ~ X1 + X2", data=pf.get_data())
 
-    run = mlflow.last_active_run()
+    run = _last_run()
     experiment = mlflow.get_experiment(run.info.experiment_id)
     assert experiment.name == "already-set"
     assert fit._r2 is not None
@@ -318,7 +333,7 @@ def test_regress_logs_markdown_summary_artifact(tmp_path):
 
     fit = regress("Y ~ X1 + X2", data=data, experiment_name="md-summary")
 
-    run = mlflow.last_active_run()
+    run = _last_run()
     artifacts = mlflow.artifacts.list_artifacts(run_id=run.info.run_id)
     assert "summary.md" in {a.path for a in artifacts}
     # the summary is self-built from the fit's own info: coefficient rows,
@@ -342,7 +357,7 @@ def test_regress_markdown_summary_works_for_all_model_types(tmp_path):
         experiment_name="md-quantreg",
     )
 
-    run = mlflow.last_active_run()
+    run = _last_run()
     md = mlflow.artifacts.load_text(f"runs:/{run.info.run_id}/summary.md")
     assert "| X1 " in md
 
@@ -386,7 +401,7 @@ def test_regress_dispatches_on_fit_type_not_function_identity(tmp_path):
         experiment_name="wrapper-model-fn",
     )
 
-    run = mlflow.last_active_run()
+    run = _last_run()
     metrics = run.data.metrics
     assert metrics["pseudo_r2"] == fit._pseudo_r2
     assert "r2" not in metrics
@@ -494,7 +509,7 @@ def test_regress_logs_experiment_hash(tmp_path):
         "Y ~ X1 + X2", data=data, global_version="v1", experiment_name="hash-logging"
     )
 
-    run = mlflow.last_active_run()
+    run = _last_run()
     assert "experiment_hash" in run.data.params
 
 
@@ -505,13 +520,13 @@ def test_regress_skips_duplicate_run_but_returns_model(tmp_path):
     fit1 = regress(
         "Y ~ X1 + X2", data=data, global_version="v1", experiment_name="dedup"
     )
-    assert len(mlflow.search_runs(experiment_names=["dedup"])) == 1
+    assert len(_search(experiment_names=["dedup"])) == 1
 
     fit2 = regress(
         "Y ~ X1 + X2", data=data, global_version="v1", experiment_name="dedup"
     )
     # Second call created no new run, but still returned a valid fitted model.
-    assert len(mlflow.search_runs(experiment_names=["dedup"])) == 1
+    assert len(_search(experiment_names=["dedup"])) == 1
     assert fit2._r2 == fit1._r2
 
 
@@ -522,7 +537,7 @@ def test_regress_different_global_version_is_not_a_duplicate(tmp_path):
     regress("Y ~ X1 + X2", data=data, global_version="v1", experiment_name="versions")
     regress("Y ~ X1 + X2", data=data, global_version="v2", experiment_name="versions")
 
-    assert len(mlflow.search_runs(experiment_names=["versions"])) == 2
+    assert len(_search(experiment_names=["versions"])) == 2
 
 
 def test_regress_different_model_fn_is_not_a_duplicate(tmp_path):
@@ -542,7 +557,7 @@ def test_regress_different_model_fn_is_not_a_duplicate(tmp_path):
         global_version="v1",
     )
 
-    assert len(mlflow.search_runs(experiment_names=["model-fn-dedup"])) == 2
+    assert len(_search(experiment_names=["model-fn-dedup"])) == 2
 
 
 def test_regress_logs_dataset_version(tmp_path):
@@ -551,7 +566,7 @@ def test_regress_logs_dataset_version(tmp_path):
     regress("Y ~ X1", data=pf.get_data(), experiment_name="dv-log")
 
     # default dataset_version is "v1"
-    assert mlflow.last_active_run().data.params["dataset_version"] == "v1"
+    assert _last_run().data.params["dataset_version"] == "v1"
 
 
 def test_regress_different_dataset_version_is_not_a_duplicate(tmp_path):
@@ -561,7 +576,7 @@ def test_regress_different_dataset_version_is_not_a_duplicate(tmp_path):
     regress("Y ~ X1 + X2", data=data, dataset_version="v1", experiment_name="dv")
     regress("Y ~ X1 + X2", data=data, dataset_version="v2", experiment_name="dv")
 
-    assert len(mlflow.search_runs(experiment_names=["dv"])) == 2
+    assert len(_search(experiment_names=["dv"])) == 2
 
 
 def test_regress_changed_data_same_version_dedups(tmp_path):
@@ -575,7 +590,7 @@ def test_regress_changed_data_same_version_dedups(tmp_path):
     changed["X1"] = changed["X1"] + 100.0
     regress("Y ~ X1 + X2", data=changed, experiment_name="dv-data")
 
-    assert len(mlflow.search_runs(experiment_names=["dv-data"])) == 1
+    assert len(_search(experiment_names=["dv-data"])) == 1
 
 
 def test_regress_accepts_polars_input(tmp_path):
@@ -587,7 +602,7 @@ def test_regress_accepts_polars_input(tmp_path):
     fit = regress("Y ~ X1 + X2", data=data, experiment_name="polars-in")
 
     assert fit._r2 is not None
-    run = mlflow.last_active_run()
+    run = _last_run()
     assert run.data.params["fml"] == "Y ~ X1 + X2"
     assert "data_shape" in run.data.params  # shape read via narwhals
 
@@ -785,7 +800,7 @@ def test_regress_applies_and_logs_steps(tmp_path):
 
     regress("Y ~ X1 + X2", data=data, steps=["standardize"], experiment_name="steps")
 
-    run = mlflow.last_active_run()
+    run = _last_run()
     assert run.data.params["steps"] == "standardize@1"
 
 
@@ -830,9 +845,7 @@ def test_regress_step_failure_is_a_failed_run(tmp_path):
             experiment_name="step-fail",
         )
 
-    runs = mlflow.search_runs(
-        experiment_names=["step-fail"], run_view_type=ViewType.ALL
-    )
+    runs = _search(experiment_names=["step-fail"], run_view_type=ViewType.ALL)
     assert len(runs) == 1
     row = runs.iloc[0]
     assert row["status"] == "FAILED"
@@ -850,7 +863,7 @@ def test_regress_logs_first_n_key_coefs_by_default(tmp_path):
 
     fit = regress("Y ~ X1 + X2", data=data, experiment_name="key-default")
 
-    run = mlflow.last_active_run()
+    run = _last_run()
     metrics = run.data.metrics
     tidy = fit.tidy()
     # Y ~ X1 + X2 has 3 coefficients (fewer than the default 5), so each is
@@ -867,7 +880,7 @@ def test_regress_caps_key_coefs_at_n(tmp_path):
 
     fit = regress("Y ~ X1 + X2", data=data, experiment_name="key-cap", n_key_coefs=2)
 
-    run = mlflow.last_active_run()
+    run = _last_run()
     logged = {k for k in run.data.metrics if k.startswith("coef.")}
     # only the first two coefficients in model order
     first_two = list(fit.tidy().index[:2])
@@ -880,7 +893,7 @@ def test_regress_n_key_coefs_zero_logs_none(tmp_path):
 
     regress("Y ~ X1 + X2", data=data, experiment_name="key-none", n_key_coefs=0)
 
-    run = mlflow.last_active_run()
+    run = _last_run()
     coef_metrics = [
         k for k in run.data.metrics if k.startswith(("coef.", "se.", "pvalue."))
     ]
@@ -898,7 +911,7 @@ def test_regress_key_coefs_selects_named_coefficients(tmp_path):
         key_coefs="X1",
     )
 
-    run = mlflow.last_active_run()
+    run = _last_run()
     metrics = run.data.metrics
     tidy = fit.tidy()
     assert metrics["coef.X1"] == float(tidy.loc["X1", "Estimate"])
@@ -910,7 +923,7 @@ def test_regress_key_coefs_selects_named_coefficients(tmp_path):
 
     # the point of first-class logging: filterable in the MLflow store
     estimate = float(tidy.loc["X1", "Estimate"])
-    hits = mlflow.search_runs(
+    hits = _search(
         experiment_names=["key-named"],
         filter_string=f"metrics.`coef.X1` < {estimate + 1e-9}",
     )
@@ -929,7 +942,7 @@ def test_key_coef_metrics_sanitize_awkward_names(tmp_path):
         "Y ~ C(f1)", data=data, experiment_name="key-sanitize", n_key_coefs=50
     )
 
-    run = mlflow.last_active_run()
+    run = _last_run()
     key = "coef.C_f1__T.1.0_"
     assert key in run.data.metrics
     assert run.data.metrics[key] == float(fit.tidy().loc["C(f1)[T.1.0]", "Estimate"])
@@ -949,7 +962,7 @@ def test_regress_key_coefs_raises_on_unknown_name(tmp_path):
         )
 
     # validation happens before the run (and even the experiment) is created
-    assert mlflow.search_runs(search_all_experiments=True).empty
+    assert _search(search_all_experiments=True).empty
 
 
 # --- error capture (#27 / #24) ---
@@ -964,9 +977,7 @@ def test_regress_logs_params_and_error_tag_when_fit_fails(tmp_path):
     with pytest.raises(Exception, match="does_not_exist"):
         regress("Y ~ does_not_exist", data=data, experiment_name="fit-error")
 
-    runs = mlflow.search_runs(
-        experiment_names=["fit-error"], run_view_type=ViewType.ALL
-    )
+    runs = _search(experiment_names=["fit-error"], run_view_type=ViewType.ALL)
     assert len(runs) == 1
     row = runs.iloc[0]
     # the failed attempt is recoverable: params were logged before the fit ...
@@ -998,7 +1009,7 @@ def test_regress_failed_run_is_not_a_dedup_hit(tmp_path):
         "Y ~ X1 + X2", data=data, model_fn=flaky_feols, experiment_name="flaky"
     )
 
-    runs = mlflow.search_runs(experiment_names=["flaky"], run_view_type=ViewType.ALL)
+    runs = _search(experiment_names=["flaky"], run_view_type=ViewType.ALL)
     assert set(runs["status"]) == {"FAILED", "FINISHED"}
     assert fit._r2 is not None
 

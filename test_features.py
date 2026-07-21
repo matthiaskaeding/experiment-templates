@@ -43,6 +43,7 @@ def test_from_state_round_trip():
     t = Standardize(**params).fit(train)
 
     # from_state rebuilds the config from the params it was constructed with
+    assert t.state is not None  # fitted above -> narrows dict | None
     rebuilt = type(t).from_state(t.state, **params)
 
     pd.testing.assert_frame_equal(t.transform(train), rebuilt.transform(train))
@@ -156,10 +157,11 @@ def test_registry_errors():
     with pytest.raises(KeyError, match="unknown feature"):
         get_feature("definitely_not_registered")
 
-    # decorating a non-FeatureTransform
+    # decorating a non-FeatureTransform (deliberately violates the decorator's
+    # type bound -- that's exactly the runtime TypeError under test)
     with pytest.raises(TypeError, match="FeatureTransform"):
 
-        @feature("_not_a_transform", version="1")
+        @feature("_not_a_transform", version="1")  # ty: ignore[invalid-argument-type]
         class _NotATransform:
             pass
 
